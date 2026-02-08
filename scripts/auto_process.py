@@ -188,18 +188,12 @@ def print_plan(actions, video_path, dry_run=False):
 # ---------------------------------------------------------------------------
 
 def compute_10_9_dimensions(src_w, src_h):
-    """Compute target dimensions for exact 10:9 aspect ratio."""
-    wide_test = src_w * 9
-    narrow_test = src_h * 10
-
-    if wide_test > narrow_test:
-        k = (src_w + 19) // 20
-    elif wide_test < narrow_test:
-        k = (src_h + 17) // 18
-    else:
-        k = (src_w + 19) // 20
-
-    return k * 20, k * 18
+    """Compute target dimensions for 10:9 pixel ratio (horizontal stretch only)."""
+    new_w = round(src_h * 10 / 9)
+    # Ensure even width for H.264
+    if new_w % 2 != 0:
+        new_w += 1
+    return new_w, src_h
 
 
 def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
@@ -268,7 +262,7 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
 
     cmd = [
         ffmpeg_path, "-i", input_path,
-        "-vf", f"scale={width}:{height},ass={escaped}",
+        "-vf", f"scale={width}:{height},setsar=1,ass={escaped}",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",

@@ -29,42 +29,27 @@ SRC_W=$("$FFPROBE" -v error -select_streams v:0 \
 SRC_H=$("$FFPROBE" -v error -select_streams v:0 \
     -show_entries stream=height -of csv=p=0 "$INPUT")
 
-echo "Source: ${SRC_W}x${SRC_H} (aspect $(echo "scale=4; $SRC_W / $SRC_H" | bc))"
+echo "Source: ${SRC_W}x${SRC_H} (pixel ratio $(echo "scale=4; $SRC_W / $SRC_H" | bc))"
 
-# Target aspect ratio: 10:9
-# Compare source AR to 10/9 ≈ 1.1111
-# If source is wider  (AR > 10/9): keep width, increase height → new_h = w * 9/10
-# If source is narrower (AR < 10/9): keep height, increase width → new_w = h * 10/9
+# Target: 10:9 pixel aspect ratio, horizontal stretch only (keep original height).
+# New width = height * 10 / 9, rounded to nearest even number for H.264.
+NEW_H=$SRC_H
+NEW_W=$(( (SRC_H * 10 + 4) / 9 ))
+# Ensure even width
+NEW_W=$(( (NEW_W + 1) / 2 * 2 ))
 
-# Use integer math: compare SRC_W * 9 vs SRC_H * 10
-WIDE_TEST=$((SRC_W * 9))
-NARROW_TEST=$((SRC_H * 10))
-
-# For exact 10:9 with H.264 (even dimensions), both W and H must be multiples
-# of 20 and 18 respectively: W=20k, H=18k guarantees W/H = 10/9 exactly.
-if [[ $WIDE_TEST -gt $NARROW_TEST ]]; then
-    # Source is wider than 10:9 → find smallest k where 20k >= SRC_W
-    K=$(( (SRC_W + 19) / 20 ))
-    echo "Source is wider than 10:9 → stretching height"
-elif [[ $WIDE_TEST -lt $NARROW_TEST ]]; then
-    # Source is narrower than 10:9 → find smallest k where 18k >= SRC_H
-    K=$(( (SRC_H + 17) / 18 ))
-    echo "Source is narrower than 10:9 → stretching width"
+if [[ $((SRC_W * 9)) -eq $((SRC_H * 10)) ]]; then
+    echo "Source is already 10:9 in pixels"
 else
-    # Already 10:9 — find nearest valid pair
-    K=$(( (SRC_W + 19) / 20 ))
-    echo "Source is already 10:9"
+    echo "Stretching horizontally: ${SRC_W} → ${NEW_W} pixels (height unchanged)"
 fi
 
-NEW_W=$(( K * 20 ))
-NEW_H=$(( K * 18 ))
-
-echo "Output:  ${NEW_W}x${NEW_H} (aspect $(echo "scale=4; $NEW_W / $NEW_H" | bc))"
+echo "Output:  ${NEW_W}x${NEW_H} (pixel ratio $(echo "scale=4; $NEW_W / $NEW_H" | bc))"
 echo "File:    $OUTPUT"
 echo ""
 
 "$FFMPEG" -i "$INPUT" \
-    -vf "scale=${NEW_W}:${NEW_H}" \
+    -vf "scale=${NEW_W}:${NEW_H},setsar=1" \
     -c:v libx264 -preset medium -crf 18 \
     -c:a aac -b:a 192k \
     -movflags +faststart \
