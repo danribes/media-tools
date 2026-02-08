@@ -70,8 +70,11 @@ def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
     """
     Quick OCR sample: extract ~10 frames from the bottom subtitle region,
     OCR each, check if >=30% have readable text.
-    Returns (has_subs, readable_count, total_count). No stdout output.
+    Also detects the language of the burned-in subtitles.
+    Returns (has_subs, readable_count, total_count, sub_lang). No stdout output.
     """
+    from langdetect import detect, LangDetectException
+
     num_samples = 10
     tmpdir = tempfile.mkdtemp(prefix="auto_ocr_")
     crop_h = int(height * 0.22)
@@ -79,6 +82,7 @@ def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
 
     readable = 0
     total = 0
+    all_text = []
 
     for i in range(num_samples):
         ts = duration * (i + 1) / (num_samples + 1)
@@ -98,13 +102,32 @@ def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
         real_words = [w for w in words if sum(1 for c in w if c.isalpha()) >= 3]
         if len(real_words) >= 3:
             readable += 1
+            all_text.append(" ".join(real_words))
 
         os.unlink(out)
 
     os.rmdir(tmpdir)
 
     has_subs = total > 0 and (readable / total) >= 0.30
-    return has_subs, readable, total
+
+    # Detect subtitle language from collected OCR text
+    sub_lang = None
+    if has_subs and all_text:
+        # Filter to only clean words (mostly alphabetic) to reduce OCR noise
+        clean_words = []
+        for text in all_text:
+            for word in text.split():
+                alpha_chars = sum(1 for c in word if c.isalpha())
+                if len(word) >= 3 and alpha_chars / len(word) >= 0.8:
+                    clean_words.append(word)
+        clean_text = " ".join(clean_words)
+        if len(clean_words) >= 5:
+            try:
+                sub_lang = detect(clean_text)
+            except LangDetectException:
+                pass
+
+    return has_subs, readable, total, sub_lang
 
 
 # ---------------------------------------------------------------------------
@@ -112,14 +135,15 @@ def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
 # ---------------------------------------------------------------------------
 
 def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_lang,
-                   width, height):
+                   width, height, sub_lang=None):
     """
     Decision matrix:
-      Audio Language | Has Burned-in Subs | Action
-      target         | Yes                | Skip subtitles
-      target         | No                 | Transcribe only (no translation)
-      other          | Yes                | OCR sync + translate
-      other          | No                 | Whisper transcribe + translate
+      Audio Language | Has Burned-in Subs | Subs Language | Action
+      target         | Yes                | *             | Skip subtitles
+      target         | No                 | *             | Transcribe only (no translation)
+      other          | Yes                | target        | Skip subtitles (already in target)
+      other          | Yes                | other/unknown | Whisper transcribe + translate
+      other          | No                 | *             | Whisper transcribe + translate
 
     Additionally: convert to 10:9 if portrait (height > width) and not already 10:9.
     Landscape videos are left at their original aspect ratio.
@@ -139,6 +163,7 @@ def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_la
         })
 
     audio_is_target = (audio_lang == target_lang)
+    subs_are_target = (sub_lang == target_lang) if sub_lang else False
 
     if audio_is_target and has_burned_subs:
         actions.append({
@@ -150,10 +175,16 @@ def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_la
             "type": "transcribe_only",
             "reason": f"Audio is '{audio_lang}' (target), no burned-in subs — transcribe without translation",
         })
-    elif not audio_is_target and has_burned_subs:
+    elif not audio_is_target and has_burned_subs and subs_are_target:
         actions.append({
-            "type": "ocr_sync_translate",
-            "reason": f"Audio is '{audio_lang}', has burned-in subs — OCR sync + translate to {target_lang}",
+            "type": "skip_subs",
+            "reason": f"Burned-in subs detected in '{sub_lang}' (target language) — no new subtitles needed",
+        })
+    elif not audio_is_target and has_burned_subs:
+        sub_info = f" (detected as '{sub_lang}')" if sub_lang else ""
+        actions.append({
+            "type": "whisper_translate",
+            "reason": f"Audio is '{audio_lang}', burned-in subs{sub_info} not in target — Whisper + translate to {target_lang}",
         })
     else:
         actions.append({
@@ -555,11 +586,13 @@ def main():
         )
 
         audio_lang, lang_prob = lang_future.result()
-        has_burned_subs, readable, total = ocr_future.result()
+        has_burned_subs, readable, total, sub_lang = ocr_future.result()
 
     print(f"  -> Audio language: {audio_lang} (confidence: {lang_prob:.2f})")
     print(f"  -> Burned-in subs: {'YES' if has_burned_subs else 'NO'} "
           f"({readable}/{total} frames with readable text)")
+    if sub_lang:
+        print(f"  -> Burned-in subs language: {sub_lang}")
 
     # === Phase 2: Decision ===
     print(f"\n{'=' * 60}")
@@ -567,7 +600,7 @@ def main():
     print(f"{'=' * 60}")
 
     actions = decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs,
-                             args.target_lang, width, height)
+                             args.target_lang, width, height, sub_lang)
     print_plan(actions, video_path, dry_run=args.dry_run)
 
     if args.dry_run:
