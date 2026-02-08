@@ -122,8 +122,7 @@ media-tools/
 ├── bin/                    # ffmpeg + ffprobe binaries (not in repo)
 ├── venv/                   # Python virtual environment (not in repo)
 ├── downloads/              # Downloaded videos (not in repo)
-├── converted/              # 10:9 converted videos (not in repo)
-└── subbed/                 # Subtitled output videos (not in repo)
+└── subbed/                 # All output videos — subtitled and/or converted (not in repo)
 ```
 
 ## License

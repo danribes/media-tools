@@ -153,9 +153,9 @@ do_download_convert_subtitle() {
     echo "=== Converting to 10:9 ==="
     "$SCRIPT_DIR/convert109.sh" "$LATEST"
 
-    CONVERTED=$(latest_mp4 "$SCRIPT_DIR/converted")
+    CONVERTED=$(latest_mp4 "$SCRIPT_DIR/subbed")
     if [[ -z "$CONVERTED" ]]; then
-        echo "Error: No .mp4 found in converted/ after conversion."
+        echo "Error: No .mp4 found in subbed/ after conversion."
         exit 1
     fi
 

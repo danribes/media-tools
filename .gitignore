@@ -4,9 +4,8 @@ venv/
 # FFmpeg binaries (downloaded separately)
 bin/
 
-# Media files (downloads, converted, subtitled outputs)
+# Media files (downloads, subtitled/converted outputs)
 downloads/
-converted/
 subbed/
 
 # Python bytecode

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONVERTED_DIR="$SCRIPT_DIR/converted"
+SUBBED_DIR="$SCRIPT_DIR/subbed"
 FFMPEG="$SCRIPT_DIR/bin/ffmpeg"
 FFPROBE="$SCRIPT_DIR/bin/ffprobe"
 
@@ -10,7 +10,7 @@ if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <input_video> [output_file]"
     echo ""
     echo "Pixel-stretches the video to a 10:9 aspect ratio and re-encodes"
-    echo "with H.264 (libx264) + AAC. Output goes to converted/ by default."
+    echo "with H.264 (libx264) + AAC. Output goes to subbed/ by default."
     exit 1
 fi
 
@@ -20,7 +20,7 @@ BASENAME="$(basename "${INPUT%.*}")"
 if [[ $# -ge 2 ]]; then
     OUTPUT="$2"
 else
-    OUTPUT="$CONVERTED_DIR/${BASENAME}_10x9.mp4"
+    OUTPUT="$SUBBED_DIR/${BASENAME}_10x9.mp4"
 fi
 
 # Get source dimensions

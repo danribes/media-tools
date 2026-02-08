@@ -388,8 +388,8 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
         print("\n  Converting to 10:9 only...")
         convert_script = os.path.join(BASE_DIR, "convert109.sh")
         subprocess.run([convert_script, video_path], check=True)
-        converted_dir = os.path.join(BASE_DIR, "converted")
-        latest = _latest_mp4(converted_dir)
+        subbed_dir = os.path.join(BASE_DIR, "subbed")
+        latest = _latest_mp4(subbed_dir)
         if latest:
             return latest
         print("  ERROR: No converted file found!")
