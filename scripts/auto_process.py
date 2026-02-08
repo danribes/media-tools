@@ -478,8 +478,11 @@ def download_url(url, base_dir=None, on_progress=print_progress):
         cmd += ["--ffmpeg-location", ffmpeg_dir]
     cmd.append(url)
 
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    output = result.stdout + result.stderr
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    output = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        on_progress(ProgressUpdate("download", f"yt-dlp failed:\n{output}", -1))
+        raise RuntimeError(f"yt-dlp download failed (exit {proc.returncode}): {output[-500:]}")
     on_progress(ProgressUpdate("download", output, 0.5))
 
     # Strategy 1: Parse yt-dlp output for the actual filename
