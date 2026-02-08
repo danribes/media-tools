@@ -1,0 +1,19 @@
+# Python virtual environment
+venv/
+
+# FFmpeg binaries (downloaded separately)
+bin/
+
+# Media files (downloads, converted, subtitled outputs)
+downloads/
+converted/
+subbed/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp files
+*.tmp
+.DS_Store
