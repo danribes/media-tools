@@ -111,7 +111,8 @@ def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
 # Phase 2 — Decision
 # ---------------------------------------------------------------------------
 
-def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_lang):
+def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_lang,
+                   width, height):
     """
     Decision matrix:
       Audio Language | Has Burned-in Subs | Action
@@ -120,14 +121,21 @@ def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_la
       other          | Yes                | OCR sync + translate
       other          | No                 | Whisper transcribe + translate
 
-    Additionally: convert to 10:9 if not already.
+    Additionally: convert to 10:9 if portrait (height > width) and not already 10:9.
+    Landscape videos are left at their original aspect ratio.
     """
     actions = []
 
-    if not is_10_9:
+    is_portrait = height > width
+    if not is_10_9 and is_portrait:
         actions.append({
             "type": "convert",
-            "reason": f"Aspect ratio {actual_ratio:.4f} is not 10:9 (1.1111)",
+            "reason": f"Portrait video ({width}x{height}, ratio {actual_ratio:.4f}) — stretch to 10:9",
+        })
+    elif not is_10_9 and not is_portrait:
+        actions.append({
+            "type": "skip_convert",
+            "reason": f"Landscape video ({width}x{height}, ratio {actual_ratio:.4f}) — skipping 10:9 conversion",
         })
 
     audio_is_target = (audio_lang == target_lang)
@@ -170,6 +178,8 @@ def print_plan(actions, video_path, dry_run=False):
         reason = action["reason"]
         if atype == "skip_subs":
             print(f"  Step {step}: SKIP subtitles — {reason}")
+        elif atype == "skip_convert":
+            print(f"  Step {step}: SKIP 10:9 conversion — {reason}")
         elif atype == "convert":
             print(f"  Step {step}: Convert to 10:9 — {reason}")
         elif atype == "transcribe_only":
@@ -374,17 +384,103 @@ def _latest_mp4(directory):
 def download_url(url):
     """Download a URL using download.sh, return the downloaded file path."""
     print(f"\n--- Downloading: {url} ---")
-    download_script = os.path.join(BASE_DIR, "download.sh")
-    subprocess.run([download_script, url], check=True)
-
     downloads_dir = os.path.join(BASE_DIR, "downloads")
-    latest = _latest_mp4(downloads_dir)
+
+    # Snapshot files and their mtimes before download
+    before = {}
+    if os.path.isdir(downloads_dir):
+        for f in glob.glob(os.path.join(downloads_dir, "*.mp4")):
+            before[f] = os.path.getmtime(f)
+
+    download_script = os.path.join(BASE_DIR, "download.sh")
+    result = subprocess.run(
+        [download_script, url],
+        check=True, capture_output=True, text=True,
+    )
+    output = result.stdout + result.stderr
+    print(output, end="")
+
+    # Strategy 1: Parse yt-dlp output for the actual filename
+    latest = _parse_downloaded_file(output, downloads_dir)
+
+    # Strategy 2: Find files that are new or whose mtime changed
+    if not latest:
+        after = {}
+        for f in glob.glob(os.path.join(downloads_dir, "*.mp4")):
+            after[f] = os.path.getmtime(f)
+
+        changed = [
+            f for f, mtime in after.items()
+            if f not in before or mtime != before[f]
+        ]
+        if changed:
+            latest = max(changed, key=os.path.getmtime)
+
+    # Strategy 3: Match by URL video ID
+    if not latest:
+        latest = _match_by_url(url, downloads_dir)
+
+    # Strategy 4: Last resort — most recent file
+    if not latest:
+        latest = _latest_mp4(downloads_dir)
+
     if not latest:
         print("ERROR: No .mp4 found in downloads/ after download.")
         sys.exit(1)
 
     print(f"  -> Downloaded: {latest}")
     return latest
+
+
+def _parse_downloaded_file(output, downloads_dir):
+    """Parse yt-dlp output to find the actual downloaded filepath."""
+    # yt-dlp prints lines like:
+    #   [download] /path/file.mp4 has already been downloaded
+    #   [download] Destination: /path/file.mp4
+    #   [Metadata] Adding metadata to "/path/file.mp4"
+    for line in output.splitlines():
+        # "has already been downloaded"
+        m = re.search(r'\[download\]\s+(.+\.mp4)\s+has already been downloaded', line)
+        if m:
+            path = m.group(1).strip()
+            if os.path.isfile(path):
+                return path
+
+        # "Destination:"
+        m = re.search(r'\[download\]\s+Destination:\s+(.+\.mp4)', line)
+        if m:
+            path = m.group(1).strip()
+            if os.path.isfile(path):
+                return path
+
+        # [Metadata] Adding metadata to "path"
+        m = re.search(r'\[Metadata\]\s+Adding metadata to\s+"(.+\.mp4)"', line)
+        if m:
+            path = m.group(1).strip()
+            if os.path.isfile(path):
+                return path
+
+    return None
+
+
+def _match_by_url(url, downloads_dir):
+    """Try to find a downloaded file by matching the video ID from the URL."""
+    # Extract numeric ID from Twitter/X URLs like .../status/1234567890
+    m = re.search(r'/status/(\d+)', url)
+    if not m:
+        return None
+
+    tweet_id = m.group(1)
+    # yt-dlp may use a different video ID (e.g. for quote tweets),
+    # so also capture the output from download.sh via yt-dlp's naming pattern
+    for f in glob.glob(os.path.join(downloads_dir, "*.mp4")):
+        # Files are named: "title [VIDEO_ID].mp4"
+        basename = os.path.basename(f)
+        id_match = re.search(r'\[(\d+)\]\.mp4$', basename)
+        if id_match and id_match.group(1) == tweet_id:
+            return f
+
+    return None
 
 
 def is_url(s):
@@ -471,7 +567,7 @@ def main():
     print(f"{'=' * 60}")
 
     actions = decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs,
-                             args.target_lang)
+                             args.target_lang, width, height)
     print_plan(actions, video_path, dry_run=args.dry_run)
 
     if args.dry_run:
