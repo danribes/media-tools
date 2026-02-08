@@ -16,6 +16,11 @@ Phases:
   1. Assessment  — dimensions, audio language, quick OCR sample
   2. Decision    — what conversion/subtitle work is needed
   3. Execution   — direct Python calls into subtitle_gen functions
+
+Usage:
+  CLI:  python scripts/auto_process.py <video_or_url> [--target-lang es] [--model small] [--dry-run]
+  API:  from scripts.auto_process import process_video
+        result = process_video("video.mp4", on_progress=my_callback)
 """
 
 import argparse
@@ -30,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Allow importing from the same scripts/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from progress import ProgressUpdate, print_progress
 from subtitle_gen import (
     assess_ocr_quality,
     burn_subtitles,
@@ -195,33 +201,35 @@ def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_la
     return actions
 
 
-def print_plan(actions, video_path, dry_run=False):
-    """Display the execution plan."""
+def _format_plan(actions, video_path, dry_run=False):
+    """Format the execution plan as a string."""
     label = "DRY RUN — " if dry_run else ""
-    print(f"\n{'=' * 60}")
-    print(f"  {label}EXECUTION PLAN")
-    print(f"{'=' * 60}")
-    print(f"  Input: {video_path}")
+    lines = []
+    lines.append(f"\n{'=' * 60}")
+    lines.append(f"  {label}EXECUTION PLAN")
+    lines.append(f"{'=' * 60}")
+    lines.append(f"  Input: {video_path}")
 
     step = 1
     for action in actions:
         atype = action["type"]
         reason = action["reason"]
         if atype == "skip_subs":
-            print(f"  Step {step}: SKIP subtitles — {reason}")
+            lines.append(f"  Step {step}: SKIP subtitles — {reason}")
         elif atype == "skip_convert":
-            print(f"  Step {step}: SKIP 10:9 conversion — {reason}")
+            lines.append(f"  Step {step}: SKIP 10:9 conversion — {reason}")
         elif atype == "convert":
-            print(f"  Step {step}: Convert to 10:9 — {reason}")
+            lines.append(f"  Step {step}: Convert to 10:9 — {reason}")
         elif atype == "transcribe_only":
-            print(f"  Step {step}: Generate subtitles (transcribe, no translation) — {reason}")
+            lines.append(f"  Step {step}: Generate subtitles (transcribe, no translation) — {reason}")
         elif atype == "ocr_sync_translate":
-            print(f"  Step {step}: Generate subtitles (OCR sync + translate) — {reason}")
+            lines.append(f"  Step {step}: Generate subtitles (OCR sync + translate) — {reason}")
         elif atype == "whisper_translate":
-            print(f"  Step {step}: Generate subtitles (Whisper + translate) — {reason}")
+            lines.append(f"  Step {step}: Generate subtitles (Whisper + translate) — {reason}")
         step += 1
 
-    print(f"{'=' * 60}\n")
+    lines.append(f"{'=' * 60}\n")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -238,52 +246,60 @@ def compute_10_9_dimensions(src_w, src_h):
 
 
 def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
-                           whisper_model, existing_region, ffmpeg, ffprobe):
+                           whisper_model, existing_region, ffmpeg, ffprobe,
+                           on_progress=print_progress):
     """
     Produce subtitle segments based on the decided strategy.
     Reuses the already-loaded whisper_model. Falls back to Whisper if OCR
     quality is too low.
     """
+    def _log(msg):
+        on_progress(ProgressUpdate("execution", msg, -1))
+
     if sub_action_type == "transcribe_only":
-        print("  Transcribing audio (same language, no translation)...")
+        _log("  Transcribing audio (same language, no translation)...")
         segments, _ = transcribe_audio(
             video_path, language=audio_lang, model_size=None,
-            model=whisper_model,
+            model=whisper_model, log=lambda m: _log(m),
         )
         return segments
 
     elif sub_action_type == "ocr_sync_translate":
-        print(f"  Running full OCR scan on '{existing_region}' region...")
+        _log(f"  Running full OCR scan on '{existing_region}' region...")
         raw_ocr = detect_burned_in_subs(
             video_path, existing_region, ffmpeg, ffprobe,
+            log=lambda m: _log(m),
         )
         is_usable, confidence, good_segments = assess_ocr_quality(raw_ocr)
-        print(f"  OCR quality: {len(good_segments)}/{len(raw_ocr)} "
-              f"readable ({confidence:.0%})")
+        _log(f"  OCR quality: {len(good_segments)}/{len(raw_ocr)} "
+             f"readable ({confidence:.0%})")
 
         if is_usable:
-            print(f"  Translating {len(good_segments)} OCR segments "
-                  f"to {target_lang}...")
-            return translate_segments(good_segments, audio_lang, target_lang)
+            _log(f"  Translating {len(good_segments)} OCR segments "
+                 f"to {target_lang}...")
+            return translate_segments(good_segments, audio_lang, target_lang,
+                                     log=lambda m: _log(m))
         else:
-            print("  OCR quality too low — falling back to Whisper...")
+            _log("  OCR quality too low — falling back to Whisper...")
             segments, detected = transcribe_audio(
                 video_path, language=audio_lang, model_size=None,
-                model=whisper_model,
+                model=whisper_model, log=lambda m: _log(m),
             )
             if detected != target_lang:
-                segments = translate_segments(segments, detected, target_lang)
+                segments = translate_segments(segments, detected, target_lang,
+                                             log=lambda m: _log(m))
             return segments
 
     elif sub_action_type == "whisper_translate":
-        print("  Transcribing audio with Whisper...")
+        _log("  Transcribing audio with Whisper...")
         segments, detected = transcribe_audio(
             video_path, language=audio_lang, model_size=None,
-            model=whisper_model,
+            model=whisper_model, log=lambda m: _log(m),
         )
         if detected != target_lang:
-            print(f"  Translating: {detected} -> {target_lang}...")
-            segments = translate_segments(segments, detected, target_lang)
+            _log(f"  Translating: {detected} -> {target_lang}...")
+            segments = translate_segments(segments, detected, target_lang,
+                                         log=lambda m: _log(m))
         return segments
 
     return []
@@ -317,11 +333,19 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
 
 
 def execute_pipeline(video_path, actions, target_lang, audio_lang,
-                     whisper_model, width, height, ffmpeg, ffprobe):
+                     whisper_model, width, height, ffmpeg, ffprobe,
+                     base_dir=None, on_progress=print_progress):
     """
     Execute the decided actions using direct Python calls.
     Combines convert + burn into a single ffmpeg pass when both are needed.
+    Returns dict with output paths.
     """
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    def _log(msg):
+        on_progress(ProgressUpdate("execution", msg, -1))
+
     needs_convert = any(a["type"] == "convert" for a in actions)
     sub_action = next(
         (a for a in actions
@@ -342,62 +366,71 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
     position = margin = existing_region = None
 
     if sub_action:
-        print("\n  Analyzing subtitle placement...")
+        _log("\n  Analyzing subtitle placement...")
         position, margin, existing_region, _, _ = find_subtitle_placement(
             video_path, ffmpeg, ffprobe,
+            log=lambda m: _log(m),
         )
 
         segments = _get_subtitle_segments(
             sub_action["type"], video_path, target_lang, audio_lang,
             whisper_model, existing_region, ffmpeg, ffprobe,
+            on_progress=on_progress,
         )
 
         if not segments:
-            print("  No speech/subtitle segments found — skipping subtitles.")
+            _log("  No speech/subtitle segments found — skipping subtitles.")
             sub_action = None
 
     # --- Write subtitle files + encode ---
+    result_paths = {}
+
     if segments:
-        out_dir = os.path.join(BASE_DIR, "subbed")
+        out_dir = os.path.join(base_dir, "subbed")
         os.makedirs(out_dir, exist_ok=True)
 
         ass_path = os.path.join(out_dir, f"{basename}.ass")
         srt_path = os.path.join(out_dir, f"{basename}.srt")
         output_path = os.path.join(out_dir, f"{basename}_subtitled.mp4")
 
-        print(f"\n  Writing subtitle files (position: {position})...")
+        _log(f"\n  Writing subtitle files (position: {position})...")
         save_srt(segments, srt_path)
-        print(f"  SRT: {srt_path}")
+        _log(f"  SRT: {srt_path}")
         generate_ass(segments, position, margin, target_w, target_h, ass_path)
-        print(f"  ASS: {ass_path}")
+        _log(f"  ASS: {ass_path}")
+
+        result_paths["output_srt"] = srt_path
+        result_paths["output_ass"] = ass_path
 
         if needs_convert:
-            print(f"\n  Single-pass encode: scale {width}x{height} -> "
-                  f"{target_w}x{target_h} + burn subtitles...")
+            _log(f"\n  Single-pass encode: scale {width}x{height} -> "
+                 f"{target_w}x{target_h} + burn subtitles...")
             _ffmpeg_convert_and_burn(
                 video_path, ass_path, output_path,
                 target_w, target_h, ffmpeg,
             )
         else:
-            print("\n  Burning subtitles into video...")
+            _log("\n  Burning subtitles into video...")
             burn_subtitles(video_path, ass_path, output_path, ffmpeg)
 
-        return output_path
+        result_paths["output_video"] = output_path
+        return output_path, result_paths
 
     elif needs_convert:
-        print("\n  Converting to 10:9 only...")
-        convert_script = os.path.join(BASE_DIR, "convert109.sh")
+        _log("\n  Converting to 10:9 only...")
+        convert_script = os.path.join(base_dir, "convert109.sh")
         subprocess.run([convert_script, video_path], check=True)
-        subbed_dir = os.path.join(BASE_DIR, "subbed")
+        subbed_dir = os.path.join(base_dir, "subbed")
         latest = _latest_mp4(subbed_dir)
         if latest:
-            return latest
-        print("  ERROR: No converted file found!")
-        sys.exit(1)
+            result_paths["output_video"] = latest
+            return latest, result_paths
+        raise RuntimeError("No converted file found after 10:9 conversion")
 
     else:
-        print("\n  Nothing to do — video is already processed.")
-        return video_path
+        _log("\n  Nothing to do — video is already processed.")
+        result_paths["output_video"] = video_path
+        return video_path, result_paths
 
 
 def _latest_mp4(directory):
@@ -412,10 +445,14 @@ def _latest_mp4(directory):
 # URL handling
 # ---------------------------------------------------------------------------
 
-def download_url(url):
-    """Download a URL using download.sh, return the downloaded file path."""
-    print(f"\n--- Downloading: {url} ---")
-    downloads_dir = os.path.join(BASE_DIR, "downloads")
+def download_url(url, base_dir=None, on_progress=print_progress):
+    """Download a URL using yt-dlp directly, return the downloaded file path."""
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    on_progress(ProgressUpdate("download", f"\n--- Downloading: {url} ---", 0.0))
+    downloads_dir = os.path.join(base_dir, "downloads")
+    os.makedirs(downloads_dir, exist_ok=True)
 
     # Snapshot files and their mtimes before download
     before = {}
@@ -423,13 +460,27 @@ def download_url(url):
         for f in glob.glob(os.path.join(downloads_dir, "*.mp4")):
             before[f] = os.path.getmtime(f)
 
-    download_script = os.path.join(BASE_DIR, "download.sh")
-    result = subprocess.run(
-        [download_script, url],
-        check=True, capture_output=True, text=True,
-    )
+    # Find ffmpeg location — prefer bin/ dir, fall back to system
+    ffmpeg_dir = os.path.join(base_dir, "bin")
+    if not os.path.isfile(os.path.join(ffmpeg_dir, "ffmpeg")):
+        ffmpeg_dir = None  # let yt-dlp find system ffmpeg
+
+    cmd = [
+        "yt-dlp",
+        "-f", "bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4",
+        "-o", os.path.join(downloads_dir, "%(title).80s [%(id)s].%(ext)s"),
+        "--no-playlist",
+        "--embed-thumbnail",
+        "--embed-metadata",
+    ]
+    if ffmpeg_dir:
+        cmd += ["--ffmpeg-location", ffmpeg_dir]
+    cmd.append(url)
+
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     output = result.stdout + result.stderr
-    print(output, end="")
+    on_progress(ProgressUpdate("download", output, 0.5))
 
     # Strategy 1: Parse yt-dlp output for the actual filename
     latest = _parse_downloaded_file(output, downloads_dir)
@@ -456,19 +507,14 @@ def download_url(url):
         latest = _latest_mp4(downloads_dir)
 
     if not latest:
-        print("ERROR: No .mp4 found in downloads/ after download.")
-        sys.exit(1)
+        raise RuntimeError("No .mp4 found in downloads/ after download.")
 
-    print(f"  -> Downloaded: {latest}")
+    on_progress(ProgressUpdate("download", f"  -> Downloaded: {latest}", 1.0))
     return latest
 
 
 def _parse_downloaded_file(output, downloads_dir):
     """Parse yt-dlp output to find the actual downloaded filepath."""
-    # yt-dlp prints lines like:
-    #   [download] /path/file.mp4 has already been downloaded
-    #   [download] Destination: /path/file.mp4
-    #   [Metadata] Adding metadata to "/path/file.mp4"
     for line in output.splitlines():
         # "has already been downloaded"
         m = re.search(r'\[download\]\s+(.+\.mp4)\s+has already been downloaded', line)
@@ -496,16 +542,12 @@ def _parse_downloaded_file(output, downloads_dir):
 
 def _match_by_url(url, downloads_dir):
     """Try to find a downloaded file by matching the video ID from the URL."""
-    # Extract numeric ID from Twitter/X URLs like .../status/1234567890
     m = re.search(r'/status/(\d+)', url)
     if not m:
         return None
 
     tweet_id = m.group(1)
-    # yt-dlp may use a different video ID (e.g. for quote tweets),
-    # so also capture the output from download.sh via yt-dlp's naming pattern
     for f in glob.glob(os.path.join(downloads_dir, "*.mp4")):
-        # Files are named: "title [VIDEO_ID].mp4"
         basename = os.path.basename(f)
         id_match = re.search(r'\[(\d+)\]\.mp4$', basename)
         if id_match and id_match.group(1) == tweet_id:
@@ -520,7 +562,156 @@ def is_url(s):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Public API — process_video()
+# ---------------------------------------------------------------------------
+
+def process_video(input_source, target_lang="es", model_size="small",
+                  dry_run=False, base_dir=None,
+                  on_progress=print_progress):
+    """
+    Main entry point for the auto-process pipeline.
+
+    Args:
+        input_source: Video file path or URL.
+        target_lang: Target subtitle language (default: "es").
+        model_size: Whisper model size (default: "small").
+        dry_run: If True, assess only — show plan without executing.
+        base_dir: Base directory for downloads/subbed (default: media-tools/).
+        on_progress: Callback receiving ProgressUpdate objects.
+
+    Returns:
+        dict with keys:
+            status: "completed" | "dry_run" | "error"
+            output_video: path to final video (if applicable)
+            output_srt: path to SRT file (if applicable)
+            output_ass: path to ASS file (if applicable)
+            assessment: dict with video info from Phase 1
+            actions: list of action dicts from Phase 2
+    """
+    if base_dir is None:
+        base_dir = BASE_DIR
+
+    ffmpeg = os.path.join(base_dir, "bin", "ffmpeg")
+    ffprobe = os.path.join(base_dir, "bin", "ffprobe")
+
+    # If bin/ ffmpeg doesn't exist, fall back to system
+    if not os.path.isfile(ffmpeg):
+        ffmpeg = "ffmpeg"
+    if not os.path.isfile(ffprobe):
+        ffprobe = "ffprobe"
+
+    result = {
+        "status": "error",
+        "output_video": None,
+        "output_srt": None,
+        "output_ass": None,
+        "assessment": {},
+        "actions": [],
+    }
+
+    # --- Resolve input ---
+    if is_url(input_source):
+        video_path = download_url(input_source, base_dir=base_dir,
+                                  on_progress=on_progress)
+    else:
+        video_path = os.path.abspath(input_source)
+        if not os.path.isfile(video_path):
+            on_progress(ProgressUpdate("assessment", f"ERROR: File not found: {video_path}", -1))
+            result["status"] = "error"
+            return result
+
+    # === Phase 1: Assessment ===
+    on_progress(ProgressUpdate("assessment",
+        f"\n{'=' * 60}\n  PHASE 1: ASSESSMENT\n{'=' * 60}\n  File: {video_path}\n", 0.1))
+
+    on_progress(ProgressUpdate("assessment", "  Checking dimensions...", 0.15))
+    width, height, duration, subtitle_streams = get_video_info(video_path, ffprobe)
+    is_10_9, actual_ratio = assess_aspect_ratio(width, height)
+
+    on_progress(ProgressUpdate("assessment",
+        f"  -> Dimensions: {width}x{height} (ratio: {actual_ratio:.4f})", 0.2))
+    on_progress(ProgressUpdate("assessment",
+        f"  -> Is 10:9: {'YES' if is_10_9 else 'NO'}", 0.2))
+    on_progress(ProgressUpdate("assessment",
+        f"  -> Duration: {duration:.1f}s ({duration/60:.1f}min)", 0.2))
+
+    if subtitle_streams:
+        on_progress(ProgressUpdate("assessment",
+            f"  -> Embedded subtitle streams: {len(subtitle_streams)}", 0.2))
+
+    # Load Whisper model once (with GPU auto-detection)
+    on_progress(ProgressUpdate("assessment", "", 0.25))
+    whisper_model = load_whisper_model(model_size,
+        log=lambda m: on_progress(ProgressUpdate("assessment", m, 0.3)))
+
+    # Parallel: language detection + OCR sampling
+    on_progress(ProgressUpdate("assessment", "\n  Running parallel assessment...", 0.35))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        lang_future = executor.submit(
+            _detect_language, video_path, whisper_model,
+        )
+        ocr_future = executor.submit(
+            _quick_ocr_sample, video_path, ffmpeg, width, height, duration,
+        )
+
+        audio_lang, lang_prob = lang_future.result()
+        has_burned_subs, readable, total, sub_lang = ocr_future.result()
+
+    on_progress(ProgressUpdate("assessment",
+        f"  -> Audio language: {audio_lang} (confidence: {lang_prob:.2f})", 0.45))
+    on_progress(ProgressUpdate("assessment",
+        f"  -> Burned-in subs: {'YES' if has_burned_subs else 'NO'} "
+        f"({readable}/{total} frames with readable text)", 0.45))
+    if sub_lang:
+        on_progress(ProgressUpdate("assessment",
+            f"  -> Burned-in subs language: {sub_lang}", 0.45))
+
+    result["assessment"] = {
+        "width": width, "height": height, "duration": duration,
+        "is_10_9": is_10_9, "actual_ratio": actual_ratio,
+        "audio_lang": audio_lang, "lang_prob": lang_prob,
+        "has_burned_subs": has_burned_subs, "sub_lang": sub_lang,
+        "readable_frames": readable, "total_frames": total,
+        "subtitle_streams": len(subtitle_streams),
+    }
+
+    # === Phase 2: Decision ===
+    on_progress(ProgressUpdate("decision",
+        f"\n{'=' * 60}\n  PHASE 2: DECISION\n{'=' * 60}", 0.5))
+
+    actions = decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs,
+                             target_lang, width, height, sub_lang)
+    result["actions"] = actions
+
+    plan_text = _format_plan(actions, video_path, dry_run=dry_run)
+    on_progress(ProgressUpdate("decision", plan_text, 0.55))
+
+    if dry_run:
+        on_progress(ProgressUpdate("done", "Dry run complete — no changes made.", 1.0))
+        result["status"] = "dry_run"
+        return result
+
+    # === Phase 3: Execution ===
+    on_progress(ProgressUpdate("execution",
+        f"{'=' * 60}\n  PHASE 3: EXECUTION\n{'=' * 60}", 0.6))
+
+    final_file, paths = execute_pipeline(
+        video_path, actions, target_lang, audio_lang,
+        whisper_model, width, height, ffmpeg, ffprobe,
+        base_dir=base_dir, on_progress=on_progress,
+    )
+
+    result.update(paths)
+    result["status"] = "completed"
+
+    on_progress(ProgressUpdate("done",
+        f"\n{'=' * 60}\n  DONE!\n  Final file: {final_file}\n{'=' * 60}", 1.0))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 def main():
@@ -542,85 +733,15 @@ def main():
     )
     args = ap.parse_args()
 
-    ffmpeg = os.path.join(BASE_DIR, "bin", "ffmpeg")
-    ffprobe = os.path.join(BASE_DIR, "bin", "ffprobe")
-
-    # --- Resolve input ---
-    if is_url(args.input):
-        video_path = download_url(args.input)
-    else:
-        video_path = os.path.abspath(args.input)
-        if not os.path.isfile(video_path):
-            print(f"ERROR: File not found: {video_path}")
-            sys.exit(1)
-
-    # === Phase 1: Assessment ===
-    print(f"\n{'=' * 60}")
-    print("  PHASE 1: ASSESSMENT")
-    print(f"{'=' * 60}")
-    print(f"  File: {video_path}\n")
-
-    # Dimensions (single ffprobe call, results reused everywhere)
-    print("  Checking dimensions...")
-    width, height, duration, subtitle_streams = get_video_info(video_path, ffprobe)
-    is_10_9, actual_ratio = assess_aspect_ratio(width, height)
-    print(f"  -> Dimensions: {width}x{height} (ratio: {actual_ratio:.4f})")
-    print(f"  -> Is 10:9: {'YES' if is_10_9 else 'NO'}")
-    print(f"  -> Duration: {duration:.1f}s ({duration/60:.1f}min)")
-
-    if subtitle_streams:
-        print(f"  -> Embedded subtitle streams: {len(subtitle_streams)}")
-
-    # Load Whisper model once (with GPU auto-detection)
-    print()
-    whisper_model = load_whisper_model(args.model)
-
-    # Parallel: language detection + OCR sampling
-    print("\n  Running parallel assessment...")
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        lang_future = executor.submit(
-            _detect_language, video_path, whisper_model,
-        )
-        ocr_future = executor.submit(
-            _quick_ocr_sample, video_path, ffmpeg, width, height, duration,
-        )
-
-        audio_lang, lang_prob = lang_future.result()
-        has_burned_subs, readable, total, sub_lang = ocr_future.result()
-
-    print(f"  -> Audio language: {audio_lang} (confidence: {lang_prob:.2f})")
-    print(f"  -> Burned-in subs: {'YES' if has_burned_subs else 'NO'} "
-          f"({readable}/{total} frames with readable text)")
-    if sub_lang:
-        print(f"  -> Burned-in subs language: {sub_lang}")
-
-    # === Phase 2: Decision ===
-    print(f"\n{'=' * 60}")
-    print("  PHASE 2: DECISION")
-    print(f"{'=' * 60}")
-
-    actions = decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs,
-                             args.target_lang, width, height, sub_lang)
-    print_plan(actions, video_path, dry_run=args.dry_run)
-
-    if args.dry_run:
-        print("Dry run complete — no changes made.")
-        return
-
-    # === Phase 3: Execution ===
-    print(f"{'=' * 60}")
-    print("  PHASE 3: EXECUTION")
-    print(f"{'=' * 60}")
-
-    final_file = execute_pipeline(
-        video_path, actions, args.target_lang, audio_lang,
-        whisper_model, width, height, ffmpeg, ffprobe,
+    result = process_video(
+        args.input,
+        target_lang=args.target_lang,
+        model_size=args.model,
+        dry_run=args.dry_run,
     )
 
-    print(f"\n{'=' * 60}")
-    print(f"  DONE!")
-    print(f"  Final file: {final_file}")
-    print(f"{'=' * 60}")
+    if result["status"] == "error":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

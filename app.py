@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""
+Streamlit web UI for media-tools auto-processing pipeline.
+
+Run: streamlit run app.py
+"""
+
+import os
+import sys
+import threading
+import time
+
+import streamlit as st
+
+# Allow importing from scripts/
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+
+from progress import ProgressUpdate
+from auto_process import process_video, is_url
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def init_session_state():
+    """Initialize session state variables."""
+    defaults = {
+        "progress_log": [],
+        "processing": False,
+        "result": None,
+        "error": None,
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+def progress_callback(update: ProgressUpdate):
+    """Thread-safe callback that appends to session state progress log."""
+    st.session_state.progress_log.append(update)
+
+
+def run_processing(input_source, target_lang, model_size, dry_run):
+    """Run process_video in a thread, storing result/error in session state."""
+    try:
+        result = process_video(
+            input_source,
+            target_lang=target_lang,
+            model_size=model_size,
+            dry_run=dry_run,
+            base_dir=BASE_DIR,
+            on_progress=progress_callback,
+        )
+        st.session_state.result = result
+    except Exception as e:
+        st.session_state.error = str(e)
+    finally:
+        st.session_state.processing = False
+
+
+def main():
+    st.set_page_config(page_title="Media Tools", page_icon="🎬", layout="wide")
+    init_session_state()
+
+    st.title("Media Tools")
+    st.caption("Auto-process videos: download, convert, subtitle, translate")
+
+    # --- Sidebar settings ---
+    with st.sidebar:
+        st.header("Settings")
+        target_lang = st.selectbox("Target language", [
+            ("es", "Spanish"),
+            ("en", "English"),
+            ("pt", "Portuguese"),
+            ("fr", "French"),
+            ("de", "German"),
+            ("it", "Italian"),
+            ("ja", "Japanese"),
+            ("ko", "Korean"),
+            ("zh", "Chinese"),
+        ], format_func=lambda x: f"{x[1]} ({x[0]})", index=0)[0]
+
+        model_size = st.selectbox("Whisper model", [
+            "tiny", "base", "small", "medium", "large",
+        ], index=2)
+
+        dry_run = st.checkbox("Dry run (assess only)", value=False)
+
+    # --- Input tabs ---
+    tab_url, tab_upload = st.tabs(["URL", "Upload file"])
+
+    input_source = None
+
+    with tab_url:
+        url = st.text_input("Paste a video URL",
+                            placeholder="https://x.com/user/status/123456...")
+        if url and is_url(url.strip()):
+            input_source = url.strip()
+        elif url:
+            st.warning("Enter a valid URL starting with http:// or https://")
+
+    with tab_upload:
+        uploaded = st.file_uploader("Upload a video file", type=["mp4", "mov", "mkv", "webm"])
+        if uploaded is not None:
+            # Save uploaded file to downloads/
+            downloads_dir = os.path.join(BASE_DIR, "downloads")
+            os.makedirs(downloads_dir, exist_ok=True)
+            save_path = os.path.join(downloads_dir, uploaded.name)
+            with open(save_path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            input_source = save_path
+            st.success(f"Saved to {save_path}")
+
+    # --- Process button ---
+    if st.button("Process", type="primary", disabled=st.session_state.processing):
+        if input_source is None:
+            st.error("Provide a URL or upload a file first.")
+        else:
+            # Reset state
+            st.session_state.progress_log = []
+            st.session_state.result = None
+            st.session_state.error = None
+            st.session_state.processing = True
+
+            thread = threading.Thread(
+                target=run_processing,
+                args=(input_source, target_lang, model_size, dry_run),
+                daemon=True,
+            )
+            thread.start()
+            st.rerun()
+
+    # --- Progress display ---
+    if st.session_state.processing:
+        status = st.status("Processing...", expanded=True)
+        last_count = 0
+
+        while st.session_state.processing:
+            log = st.session_state.progress_log
+            if len(log) > last_count:
+                for update in log[last_count:]:
+                    msg = update.message.strip()
+                    if msg:
+                        status.write(msg)
+                last_count = len(log)
+            time.sleep(0.5)
+
+        # Flush remaining messages
+        log = st.session_state.progress_log
+        for update in log[last_count:]:
+            msg = update.message.strip()
+            if msg:
+                status.write(msg)
+
+        if st.session_state.error:
+            status.update(label="Error", state="error")
+        else:
+            status.update(label="Complete", state="complete")
+
+        st.rerun()
+
+    # --- Error display ---
+    if st.session_state.error:
+        st.error(f"Processing failed: {st.session_state.error}")
+
+        # Still show log
+        with st.expander("Processing log", expanded=False):
+            for update in st.session_state.progress_log:
+                msg = update.message.strip()
+                if msg:
+                    st.text(msg)
+
+    # --- Results display ---
+    result = st.session_state.result
+    if result and result["status"] in ("completed", "dry_run"):
+        # Show assessment summary
+        assessment = result.get("assessment", {})
+        if assessment:
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Dimensions", f"{assessment.get('width', '?')}x{assessment.get('height', '?')}")
+            col2.metric("Duration", f"{assessment.get('duration', 0):.0f}s")
+            col3.metric("Audio", assessment.get("audio_lang", "?"))
+            col4.metric("Burned-in subs", "Yes" if assessment.get("has_burned_subs") else "No")
+
+        # Show actions
+        actions = result.get("actions", [])
+        if actions:
+            with st.expander("Execution plan", expanded=False):
+                for action in actions:
+                    st.write(f"**{action['type']}**: {action['reason']}")
+
+        # Show full log
+        with st.expander("Processing log", expanded=False):
+            for update in st.session_state.progress_log:
+                msg = update.message.strip()
+                if msg:
+                    st.text(msg)
+
+        if result["status"] == "dry_run":
+            st.info("Dry run complete — no files were produced.")
+            return
+
+        # --- Video preview + downloads ---
+        video_path = result.get("output_video")
+        srt_path = result.get("output_srt")
+        ass_path = result.get("output_ass")
+
+        if video_path and os.path.isfile(video_path):
+            st.subheader("Result")
+            st.video(video_path)
+
+            # Download buttons
+            cols = st.columns(3)
+            with cols[0]:
+                with open(video_path, "rb") as f:
+                    st.download_button(
+                        "Download video",
+                        f.read(),
+                        file_name=os.path.basename(video_path),
+                        mime="video/mp4",
+                    )
+
+            if srt_path and os.path.isfile(srt_path):
+                with cols[1]:
+                    with open(srt_path, "r") as f:
+                        st.download_button(
+                            "Download SRT",
+                            f.read(),
+                            file_name=os.path.basename(srt_path),
+                            mime="text/plain",
+                        )
+
+            if ass_path and os.path.isfile(ass_path):
+                with cols[2]:
+                    with open(ass_path, "r") as f:
+                        st.download_button(
+                            "Download ASS",
+                            f.read(),
+                            file_name=os.path.basename(ass_path),
+                            mime="text/plain",
+                        )
+        elif not video_path:
+            st.info("No output video — the video may have needed no processing.")
+
+
+if __name__ == "__main__":
+    main()

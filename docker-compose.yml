@@ -1,0 +1,15 @@
+services:
+  media-tools:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./subbed:/app/subbed
+      - whisper-cache:/root/.cache/huggingface
+    environment:
+      - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=500
+    restart: unless-stopped
+
+volumes:
+  whisper-cache:

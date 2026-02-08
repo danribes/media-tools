@@ -100,7 +100,7 @@ def analyze_text_regions(frame_paths, width, height):
     return combined, mean, std
 
 
-def find_subtitle_placement(video_path, ffmpeg_path, ffprobe_path):
+def find_subtitle_placement(video_path, ffmpeg_path, ffprobe_path, log=print):
     """
     Analyze frame regions and decide where to place new subtitles.
     Returns (new_sub_position, margin, existing_sub_region, width, height).
@@ -111,16 +111,16 @@ def find_subtitle_placement(video_path, ffmpeg_path, ffprobe_path):
     )
 
     if not frames:
-        print("  (frame extraction failed — defaulting to top)")
+        log("  (frame extraction failed — defaulting to top)")
         return "top", max(10, int(h * 0.03)), "bottom", w, h
 
     combined, means, stds = analyze_text_regions(frames, w, h)
 
     labels = ["top", "upper-mid", "center", "lower-mid", "bottom"]
-    print("  Region scores (lower = more free):")
+    log("  Region scores (lower = more free):")
     for i, (label, score) in enumerate(zip(labels, combined)):
         tag = " <- candidate" if i in (0, 4) else ""
-        print(f"    {label:>10}: {score:6.1f}{tag}")
+        log(f"    {label:>10}: {score:6.1f}{tag}")
 
     top_score = combined[0]
     bot_score = combined[4]
@@ -139,8 +139,8 @@ def find_subtitle_placement(video_path, ffmpeg_path, ffprobe_path):
         os.unlink(f)
     os.rmdir(tmpdir)
 
-    print(f"  -> Best placement for new subs: {new_position} (margin {margin}px)")
-    print(f"  -> Existing content detected at: {existing_region}")
+    log(f"  -> Best placement for new subs: {new_position} (margin {margin}px)")
+    log(f"  -> Existing content detected at: {existing_region}")
     return new_position, margin, existing_region, w, h
 
 
@@ -243,12 +243,12 @@ def group_ocr_results(results, frame_interval, min_duration=0.4):
     return segments
 
 
-def detect_burned_in_subs(video_path, region, ffmpeg_path, ffprobe_path):
+def detect_burned_in_subs(video_path, region, ffmpeg_path, ffprobe_path, log=print):
     """
     OCR-scan the given region for burned-in subtitles.
     Returns list of {start, end, text} segments, or empty list.
     """
-    print(f"  Extracting frames from '{region}' region at 2 fps...")
+    log(f"  Extracting frames from '{region}' region at 2 fps...")
     frames, tmpdir, interval = extract_frames_dense(
         video_path, fps=2, region=region,
         ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
@@ -257,7 +257,7 @@ def detect_burned_in_subs(video_path, region, ffmpeg_path, ffprobe_path):
     if not frames:
         return []
 
-    print(f"  Running OCR on {len(frames)} frames...")
+    log(f"  Running OCR on {len(frames)} frames...")
     results = []
     for i, fp in enumerate(frames):
         timestamp = i * interval
@@ -265,7 +265,7 @@ def detect_burned_in_subs(video_path, region, ffmpeg_path, ffprobe_path):
         results.append((timestamp, text))
         # Progress indicator every 20 frames
         if (i + 1) % 20 == 0:
-            print(f"    ... {i + 1}/{len(frames)} frames processed")
+            log(f"    ... {i + 1}/{len(frames)} frames processed")
 
     # Cleanup temp frames
     for f in frames:
@@ -336,12 +336,12 @@ def get_whisper_device():
     return "cpu", "int8"
 
 
-def load_whisper_model(model_size="small"):
+def load_whisper_model(model_size="small", log=print):
     """Load a Whisper model with GPU auto-detection."""
     from faster_whisper import WhisperModel
 
     device, compute_type = get_whisper_device()
-    print(f"  Loading Whisper model '{model_size}' on {device}...")
+    log(f"  Loading Whisper model '{model_size}' on {device}...")
     return WhisperModel(model_size, device=device, compute_type=compute_type)
 
 
@@ -357,12 +357,12 @@ def detect_language_quick(video_path, model_size="small", model=None):
 # Transcription
 # ---------------------------------------------------------------------------
 
-def transcribe_audio(video_path, language, model_size, model=None):
+def transcribe_audio(video_path, language, model_size, model=None, log=print):
     """Transcribe with faster-whisper. Returns (segments, detected_lang)."""
     if model is None:
         model = load_whisper_model(model_size)
 
-    print("  Transcribing audio...")
+    log("  Transcribing audio...")
     segments_iter, info = model.transcribe(
         video_path,
         language=language if language != "auto" else None,
@@ -370,7 +370,7 @@ def transcribe_audio(video_path, language, model_size, model=None):
     )
 
     detected = info.language
-    print(f"  Detected language: {detected} (p={info.language_probability:.2f})")
+    log(f"  Detected language: {detected} (p={info.language_probability:.2f})")
 
     segments = []
     for seg in segments_iter:
@@ -387,11 +387,11 @@ def transcribe_audio(video_path, language, model_size, model=None):
 # Translation
 # ---------------------------------------------------------------------------
 
-def translate_segments(segments, source_lang, target_lang="es"):
+def translate_segments(segments, source_lang, target_lang="es", log=print):
     """Translate subtitle text using deep-translator (Google free API)."""
     from deep_translator import GoogleTranslator
 
-    print(f"  Translating {len(segments)} segments: {source_lang} -> {target_lang}")
+    log(f"  Translating {len(segments)} segments: {source_lang} -> {target_lang}")
     translator = GoogleTranslator(source=source_lang, target=target_lang)
 
     for seg in segments:
@@ -400,7 +400,7 @@ def translate_segments(segments, source_lang, target_lang="es"):
             if translated:
                 seg["text"] = translated
         except Exception as e:
-            print(f"  Warning: Translation failed for segment: {e}")
+            log(f"  Warning: Translation failed for segment: {e}")
 
     return segments
 
