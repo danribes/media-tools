@@ -387,6 +387,15 @@ def transcribe_audio(video_path, language, model_size, model=None, log=print):
 # Translation
 # ---------------------------------------------------------------------------
 
+class UnsupportedLanguageError(Exception):
+    """Raised when the detected language is not supported by the translator."""
+    def __init__(self, lang):
+        self.lang = lang
+        super().__init__(
+            f"Detected language '{lang}' is not supported by the translation service"
+        )
+
+
 _GOOGLE_LANG_MAP = {
     "zh": "zh-CN",
     "he": "iw",
@@ -403,7 +412,10 @@ def translate_segments(segments, source_lang, target_lang="es", log=print):
     target_lang = _GOOGLE_LANG_MAP.get(target_lang, target_lang)
 
     log(f"  Translating {len(segments)} segments: {source_lang} -> {target_lang}")
-    translator = GoogleTranslator(source=source_lang, target=target_lang)
+    try:
+        translator = GoogleTranslator(source=source_lang, target=target_lang)
+    except Exception:
+        raise UnsupportedLanguageError(source_lang)
 
     for seg in segments:
         try:

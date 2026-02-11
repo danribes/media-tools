@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scr
 
 from progress import ProgressUpdate, format_time
 from auto_process import process_video, is_url
+from subtitle_gen import UnsupportedLanguageError
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -27,6 +28,7 @@ def init_session_state():
         "processing": False,
         "result": None,
         "error": None,
+        "unsupported_lang": None,  # set when translator doesn't support detected lang
         "progress_log": [],
         # Plain dict shared with background thread.  st.session_state is
         # thread-local in Streamlit so the worker writes here instead.
@@ -45,6 +47,7 @@ def _make_shared():
         "processing": True,
         "result": None,
         "error": None,
+        "unsupported_lang": None,
         "start_time": time.time(),
     }
 
@@ -76,6 +79,8 @@ def _run_processing(shared, input_source, target_lang, model_size, dry_run,
             convert_portrait=convert_portrait,
         )
         shared["result"] = result
+    except UnsupportedLanguageError as e:
+        shared["unsupported_lang"] = e.lang
     except Exception as e:
         shared["error"] = str(e)
     finally:
@@ -99,9 +104,12 @@ def main():
         ], index=0)
         target_lang = {"Spanish (es)": "es", "English (en)": "en", "No subtitles": None}[subtitle_mode]
 
-        model_size = st.selectbox("Whisper model", [
-            "tiny", "base", "small", "medium", "large",
-        ], index=2)
+        if target_lang is not None:
+            model_size = st.selectbox("Whisper model", [
+                "tiny", "base", "small", "medium", "large",
+            ], index=2)
+        else:
+            model_size = "small"
 
         convert_portrait = st.checkbox("Convert portrait to 10:9", value=True)
 
@@ -140,6 +148,7 @@ def main():
             # Reset state
             st.session_state.result = None
             st.session_state.error = None
+            st.session_state.unsupported_lang = None
             st.session_state.progress_log = []
             st.session_state.processing = True
 
@@ -163,6 +172,7 @@ def main():
             # Transfer results to session state and do a final rerun
             st.session_state.result = shared["result"]
             st.session_state.error = shared["error"]
+            st.session_state.unsupported_lang = shared.get("unsupported_lang")
             st.session_state.progress_log = list(shared["progress_log"])
             st.session_state.processing = False
             st.session_state.shared = None
@@ -199,8 +209,46 @@ def main():
         time.sleep(0.5)
         st.rerun()
 
+    # --- Unsupported language prompt ---
+    if st.session_state.unsupported_lang:
+        lang = st.session_state.unsupported_lang
+        st.warning(
+            f"The detected audio language **'{lang}'** is not supported by the "
+            f"translation service. This video cannot be subtitled."
+        )
+        col_continue, col_stop, _ = st.columns([1, 1, 3])
+        with col_continue:
+            if st.button("Continue without subtitles"):
+                st.session_state.unsupported_lang = None
+                st.session_state.error = None
+                st.session_state.progress_log = []
+                st.session_state.processing = True
+
+                shared = _make_shared()
+                st.session_state.shared = shared
+
+                thread = threading.Thread(
+                    target=_run_processing,
+                    args=(shared, input_source, None, model_size, dry_run,
+                          convert_portrait),
+                    daemon=True,
+                )
+                thread.start()
+                st.rerun()
+        with col_stop:
+            if st.button("Stop"):
+                st.session_state.unsupported_lang = None
+
+        with st.expander("Processing log", expanded=False):
+            for update in st.session_state.progress_log:
+                if update.phase == "step":
+                    continue
+                msg = update.message.strip()
+                if msg:
+                    st.text(msg)
+
     # --- Error display ---
-    if st.session_state.error:
+    elif st.session_state.error:
         st.error(f"Processing failed: {st.session_state.error}")
 
         with st.expander("Processing log", expanded=False):
