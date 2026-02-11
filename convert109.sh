@@ -31,10 +31,19 @@ SRC_H=$("$FFPROBE" -v error -select_streams v:0 \
 
 echo "Source: ${SRC_W}x${SRC_H} (pixel ratio $(echo "scale=4; $SRC_W / $SRC_H" | bc))"
 
-# Target: 10:9 pixel aspect ratio, horizontal stretch only (keep original height).
+# Cap height at 1920 for fast encoding
+MAX_H=1920
+if [[ $SRC_H -gt $MAX_H ]]; then
+    NEW_H=$MAX_H
+else
+    NEW_H=$SRC_H
+fi
+# Ensure even height
+NEW_H=$(( (NEW_H / 2) * 2 ))
+
+# Target: 10:9 pixel aspect ratio, horizontal stretch only.
 # New width = height * 10 / 9, rounded to nearest even number for H.264.
-NEW_H=$SRC_H
-NEW_W=$(( (SRC_H * 10 + 4) / 9 ))
+NEW_W=$(( (NEW_H * 10 + 4) / 9 ))
 # Ensure even width
 NEW_W=$(( (NEW_W + 1) / 2 * 2 ))
 
@@ -50,8 +59,8 @@ echo ""
 
 "$FFMPEG" -i "$INPUT" \
     -vf "scale=${NEW_W}:${NEW_H},setsar=1" \
-    -c:v libx264 -preset medium -crf 18 \
-    -c:a aac -b:a 192k \
+    -c:v libx264 -preset fast -crf 23 \
+    -c:a aac -b:a 128k \
     -movflags +faststart \
     -y \
     "$OUTPUT"

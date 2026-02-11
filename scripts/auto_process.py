@@ -236,13 +236,24 @@ def _format_plan(actions, video_path, dry_run=False):
 # Phase 3 — Execution helpers
 # ---------------------------------------------------------------------------
 
+MAX_HEIGHT = 1920  # Cap output resolution for fast encoding
+
+
 def compute_10_9_dimensions(src_w, src_h):
-    """Compute target dimensions for 10:9 pixel ratio (horizontal stretch only)."""
-    new_w = round(src_h * 10 / 9)
+    """Compute target dimensions for 10:9 pixel ratio (horizontal stretch only).
+
+    Caps height at MAX_HEIGHT to keep encoding fast. The 10:9 stretch is
+    applied after downscaling.
+    """
+    h = min(src_h, MAX_HEIGHT)
+    # Ensure even height
+    if h % 2 != 0:
+        h -= 1
+    new_w = round(h * 10 / 9)
     # Ensure even width for H.264
     if new_w % 2 != 0:
         new_w += 1
-    return new_w, src_h
+    return new_w, h
 
 
 def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
@@ -352,8 +363,8 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
     cmd = [
         ffmpeg_path, "-i", input_path,
         "-vf", f"scale={width}:{height},setsar=1,ass={escaped}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         "-y", output_path,
     ]
