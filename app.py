@@ -15,7 +15,7 @@ import streamlit as st
 # Allow importing from scripts/
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 
-from progress import ProgressUpdate
+from progress import ProgressUpdate, format_time
 from auto_process import process_video, is_url
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +28,7 @@ def init_session_state():
         "processing": False,
         "result": None,
         "error": None,
+        "step_info": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -36,6 +37,12 @@ def init_session_state():
 
 def progress_callback(update: ProgressUpdate):
     """Thread-safe callback that appends to session state progress log."""
+    if update.phase == "step":
+        st.session_state.step_info = {
+            "name": update.message,
+            "percent": update.percent,
+            **update.detail,
+        }
     st.session_state.progress_log.append(update)
 
 
@@ -119,6 +126,7 @@ def main():
             st.session_state.progress_log = []
             st.session_state.result = None
             st.session_state.error = None
+            st.session_state.step_info = None
             st.session_state.processing = True
 
             thread = threading.Thread(
@@ -131,30 +139,56 @@ def main():
 
     # --- Progress display ---
     if st.session_state.processing:
-        status = st.status("Processing...", expanded=True)
+        progress_bar = st.progress(0, text="Starting...")
+        status = st.status("Processing log", expanded=False)
         last_count = 0
 
         while st.session_state.processing:
+            # Update progress bar from step info
+            step = st.session_state.step_info
+            if step:
+                elapsed_str = format_time(step["elapsed"])
+                if step["remaining"] >= 0:
+                    remaining_str = f"~{format_time(step['remaining'])} remaining"
+                else:
+                    remaining_str = "estimating..."
+                text = (f"Step {step['step']}/{step['total']}: "
+                        f"{step['name']}  \u2014  "
+                        f"{elapsed_str} elapsed, {remaining_str}")
+                progress_bar.progress(
+                    min(step.get("percent", 0), 0.99), text=text)
+
+            # Update detail log
             log = st.session_state.progress_log
             if len(log) > last_count:
                 for update in log[last_count:]:
+                    if update.phase == "step":
+                        continue
                     msg = update.message.strip()
                     if msg:
                         status.write(msg)
                 last_count = len(log)
-            time.sleep(0.5)
+            time.sleep(0.3)
 
         # Flush remaining messages
         log = st.session_state.progress_log
         for update in log[last_count:]:
+            if update.phase == "step":
+                continue
             msg = update.message.strip()
             if msg:
                 status.write(msg)
 
+        # Final state
+        step = st.session_state.step_info
         if st.session_state.error:
-            status.update(label="Error", state="error")
+            elapsed_str = format_time(step["elapsed"]) if step else "0s"
+            progress_bar.progress(1.0, text=f"Error after {elapsed_str}")
+            status.update(label="Processing log", state="error")
         else:
-            status.update(label="Complete", state="complete")
+            elapsed_str = format_time(step["elapsed"]) if step else "0s"
+            progress_bar.progress(1.0, text=f"Complete! ({elapsed_str})")
+            status.update(label="Processing log", state="complete")
 
         st.rerun()
 
@@ -165,6 +199,8 @@ def main():
         # Still show log
         with st.expander("Processing log", expanded=False):
             for update in st.session_state.progress_log:
+                if update.phase == "step":
+                    continue
                 msg = update.message.strip()
                 if msg:
                     st.text(msg)
@@ -191,6 +227,8 @@ def main():
         # Show full log
         with st.expander("Processing log", expanded=False):
             for update in st.session_state.progress_log:
+                if update.phase == "step":
+                    continue
                 msg = update.message.strip()
                 if msg:
                     st.text(msg)

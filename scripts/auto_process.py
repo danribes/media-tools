@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Allow importing from the same scripts/ directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from progress import ProgressUpdate, print_progress
+from progress import ProgressUpdate, StepTracker, print_progress
 from subtitle_gen import (
     assess_ocr_quality,
     burn_subtitles,
@@ -247,7 +247,7 @@ def compute_10_9_dimensions(src_w, src_h):
 
 def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
                            whisper_model, existing_region, ffmpeg, ffprobe,
-                           on_progress=print_progress):
+                           on_progress=print_progress, tracker=None):
     """
     Produce subtitle segments based on the decided strategy.
     Reuses the already-loaded whisper_model. Falls back to Whisper if OCR
@@ -257,14 +257,20 @@ def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
         on_progress(ProgressUpdate("execution", msg, -1))
 
     if sub_action_type == "transcribe_only":
+        if tracker:
+            tracker.begin("Transcribing audio")
         _log("  Transcribing audio (same language, no translation)...")
         segments, _ = transcribe_audio(
             video_path, language=audio_lang, model_size=None,
             model=whisper_model, log=lambda m: _log(m),
         )
+        if tracker:
+            tracker.finish("Transcribing audio")
         return segments
 
     elif sub_action_type == "ocr_sync_translate":
+        if tracker:
+            tracker.begin("Transcribing audio")
         _log(f"  Running full OCR scan on '{existing_region}' region...")
         raw_ocr = detect_burned_in_subs(
             video_path, existing_region, ffmpeg, ffprobe,
@@ -275,31 +281,57 @@ def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
              f"readable ({confidence:.0%})")
 
         if is_usable:
+            if tracker:
+                tracker.finish("Transcribing audio")
+                tracker.begin("Translating subtitles")
             _log(f"  Translating {len(good_segments)} OCR segments "
                  f"to {target_lang}...")
-            return translate_segments(good_segments, audio_lang, target_lang,
-                                     log=lambda m: _log(m))
+            result = translate_segments(good_segments, audio_lang, target_lang,
+                                       log=lambda m: _log(m))
+            if tracker:
+                tracker.finish("Translating subtitles")
+            return result
         else:
             _log("  OCR quality too low — falling back to Whisper...")
             segments, detected = transcribe_audio(
                 video_path, language=audio_lang, model_size=None,
                 model=whisper_model, log=lambda m: _log(m),
             )
+            if tracker:
+                tracker.finish("Transcribing audio")
             if detected != target_lang:
+                if tracker:
+                    tracker.begin("Translating subtitles")
                 segments = translate_segments(segments, detected, target_lang,
                                              log=lambda m: _log(m))
+                if tracker:
+                    tracker.finish("Translating subtitles")
+            else:
+                if tracker:
+                    tracker.skip("Translating subtitles")
             return segments
 
     elif sub_action_type == "whisper_translate":
+        if tracker:
+            tracker.begin("Transcribing audio")
         _log("  Transcribing audio with Whisper...")
         segments, detected = transcribe_audio(
             video_path, language=audio_lang, model_size=None,
             model=whisper_model, log=lambda m: _log(m),
         )
-        if detected != target_lang:
+        if tracker:
+            tracker.finish("Transcribing audio")
+        if detected != target_lang and segments:
+            if tracker:
+                tracker.begin("Translating subtitles")
             _log(f"  Translating: {detected} -> {target_lang}...")
             segments = translate_segments(segments, detected, target_lang,
                                          log=lambda m: _log(m))
+            if tracker:
+                tracker.finish("Translating subtitles")
+        else:
+            if tracker:
+                tracker.skip("Translating subtitles")
         return segments
 
     return []
@@ -334,7 +366,7 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
 
 def execute_pipeline(video_path, actions, target_lang, audio_lang,
                      whisper_model, width, height, ffmpeg, ffprobe,
-                     base_dir=None, on_progress=print_progress):
+                     base_dir=None, on_progress=print_progress, tracker=None):
     """
     Execute the decided actions using direct Python calls.
     Combines convert + burn into a single ffmpeg pass when both are needed.
@@ -366,21 +398,28 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
     position = margin = existing_region = None
 
     if sub_action:
-        _log("\n  Analyzing subtitle placement...")
+        if tracker:
+            tracker.begin("Analyzing subtitle placement")
         position, margin, existing_region, _, _ = find_subtitle_placement(
             video_path, ffmpeg, ffprobe,
             log=lambda m: _log(m),
         )
+        if tracker:
+            tracker.finish("Analyzing subtitle placement")
 
         segments = _get_subtitle_segments(
             sub_action["type"], video_path, target_lang, audio_lang,
             whisper_model, existing_region, ffmpeg, ffprobe,
-            on_progress=on_progress,
+            on_progress=on_progress, tracker=tracker,
         )
 
         if not segments:
             _log("  No speech/subtitle segments found — skipping subtitles.")
             sub_action = None
+            if tracker:
+                tracker.skip("Generating subtitle files")
+                if not needs_convert:
+                    tracker.skip("Encoding video")
 
     # --- Write subtitle files + encode ---
     result_paths = {}
@@ -393,42 +432,55 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
         srt_path = os.path.join(out_dir, f"{basename}.srt")
         output_path = os.path.join(out_dir, f"{basename}_subtitled.mp4")
 
-        _log(f"\n  Writing subtitle files (position: {position})...")
+        if tracker:
+            tracker.begin("Generating subtitle files")
+        _log(f"  Writing subtitle files (position: {position})...")
         save_srt(segments, srt_path)
         _log(f"  SRT: {srt_path}")
         generate_ass(segments, position, margin, target_w, target_h, ass_path)
         _log(f"  ASS: {ass_path}")
+        if tracker:
+            tracker.finish("Generating subtitle files")
 
         result_paths["output_srt"] = srt_path
         result_paths["output_ass"] = ass_path
 
+        if tracker:
+            tracker.begin("Encoding video")
         if needs_convert:
-            _log(f"\n  Single-pass encode: scale {width}x{height} -> "
+            _log(f"  Encoding: scale {width}x{height} -> "
                  f"{target_w}x{target_h} + burn subtitles...")
             _ffmpeg_convert_and_burn(
                 video_path, ass_path, output_path,
                 target_w, target_h, ffmpeg,
             )
         else:
-            _log("\n  Burning subtitles into video...")
+            _log("  Burning subtitles into video...")
             burn_subtitles(video_path, ass_path, output_path, ffmpeg)
+        if tracker:
+            tracker.finish("Encoding video")
 
         result_paths["output_video"] = output_path
         return output_path, result_paths
 
     elif needs_convert:
-        _log("\n  Converting to 10:9 only...")
+        if tracker:
+            tracker.begin("Encoding video")
+        _log("  Converting to 10:9...")
         convert_script = os.path.join(base_dir, "convert109.sh")
-        subprocess.run([convert_script, video_path], check=True)
+        subprocess.run([convert_script, video_path], check=True,
+                       capture_output=True)
         subbed_dir = os.path.join(base_dir, "subbed")
         latest = _latest_mp4(subbed_dir)
+        if tracker:
+            tracker.finish("Encoding video")
         if latest:
             result_paths["output_video"] = latest
             return latest, result_paths
         raise RuntimeError("No converted file found after 10:9 conversion")
 
     else:
-        _log("\n  Nothing to do — video is already processed.")
+        _log("  Nothing to do — video is already processed.")
         result_paths["output_video"] = video_path
         return video_path, result_paths
 
@@ -603,6 +655,20 @@ def process_video(input_source, target_lang="es", model_size="small",
     if not os.path.isfile(ffprobe):
         ffprobe = "ffprobe"
 
+    # --- Build step tracker ---
+    tracker = StepTracker(on_progress)
+    if is_url(input_source):
+        tracker.add_step("Downloading video", weight=15)
+    tracker.add_step("Analyzing video", weight=2)
+    tracker.add_step("Loading Whisper model", weight=8)
+    tracker.add_step("Detecting language & scanning subtitles", weight=10)
+    tracker.add_step("Planning actions", weight=1)
+    tracker.add_step("Analyzing subtitle placement", weight=5)
+    tracker.add_step("Transcribing audio", weight=30)
+    tracker.add_step("Translating subtitles", weight=8)
+    tracker.add_step("Generating subtitle files", weight=1)
+    tracker.add_step("Encoding video", weight=25)
+
     result = {
         "status": "error",
         "output_video": None,
@@ -614,8 +680,10 @@ def process_video(input_source, target_lang="es", model_size="small",
 
     # --- Resolve input ---
     if is_url(input_source):
+        tracker.begin("Downloading video")
         video_path = download_url(input_source, base_dir=base_dir,
                                   on_progress=on_progress)
+        tracker.finish("Downloading video")
     else:
         video_path = os.path.abspath(input_source)
         if not os.path.isfile(video_path):
@@ -624,31 +692,29 @@ def process_video(input_source, target_lang="es", model_size="small",
             return result
 
     # === Phase 1: Assessment ===
-    on_progress(ProgressUpdate("assessment",
-        f"\n{'=' * 60}\n  PHASE 1: ASSESSMENT\n{'=' * 60}\n  File: {video_path}\n", 0.1))
+    tracker.begin("Analyzing video")
+    on_progress(ProgressUpdate("assessment", f"  File: {video_path}", -1))
 
-    on_progress(ProgressUpdate("assessment", "  Checking dimensions...", 0.15))
     width, height, duration, subtitle_streams = get_video_info(video_path, ffprobe)
     is_10_9, actual_ratio = assess_aspect_ratio(width, height)
 
     on_progress(ProgressUpdate("assessment",
-        f"  -> Dimensions: {width}x{height} (ratio: {actual_ratio:.4f})", 0.2))
+        f"  Dimensions: {width}x{height} (ratio: {actual_ratio:.4f})", -1))
     on_progress(ProgressUpdate("assessment",
-        f"  -> Is 10:9: {'YES' if is_10_9 else 'NO'}", 0.2))
-    on_progress(ProgressUpdate("assessment",
-        f"  -> Duration: {duration:.1f}s ({duration/60:.1f}min)", 0.2))
-
+        f"  Duration: {duration:.1f}s ({duration/60:.1f}min)", -1))
     if subtitle_streams:
         on_progress(ProgressUpdate("assessment",
-            f"  -> Embedded subtitle streams: {len(subtitle_streams)}", 0.2))
+            f"  Embedded subtitle streams: {len(subtitle_streams)}", -1))
+    tracker.finish("Analyzing video")
 
     # Load Whisper model once (with GPU auto-detection)
-    on_progress(ProgressUpdate("assessment", "", 0.25))
+    tracker.begin("Loading Whisper model")
     whisper_model = load_whisper_model(model_size,
-        log=lambda m: on_progress(ProgressUpdate("assessment", m, 0.3)))
+        log=lambda m: on_progress(ProgressUpdate("assessment", m, -1)))
+    tracker.finish("Loading Whisper model")
 
     # Parallel: language detection + OCR sampling
-    on_progress(ProgressUpdate("assessment", "\n  Running parallel assessment...", 0.35))
+    tracker.begin("Detecting language & scanning subtitles")
     with ThreadPoolExecutor(max_workers=2) as executor:
         lang_future = executor.submit(
             _detect_language, video_path, whisper_model,
@@ -661,13 +727,14 @@ def process_video(input_source, target_lang="es", model_size="small",
         has_burned_subs, readable, total, sub_lang = ocr_future.result()
 
     on_progress(ProgressUpdate("assessment",
-        f"  -> Audio language: {audio_lang} (confidence: {lang_prob:.2f})", 0.45))
+        f"  Audio language: {audio_lang} (confidence: {lang_prob:.2f})", -1))
     on_progress(ProgressUpdate("assessment",
-        f"  -> Burned-in subs: {'YES' if has_burned_subs else 'NO'} "
-        f"({readable}/{total} frames with readable text)", 0.45))
+        f"  Burned-in subs: {'YES' if has_burned_subs else 'NO'} "
+        f"({readable}/{total} frames with readable text)", -1))
     if sub_lang:
         on_progress(ProgressUpdate("assessment",
-            f"  -> Burned-in subs language: {sub_lang}", 0.45))
+            f"  Burned-in subs language: {sub_lang}", -1))
+    tracker.finish("Detecting language & scanning subtitles")
 
     result["assessment"] = {
         "width": width, "height": height, "duration": duration,
@@ -679,36 +746,55 @@ def process_video(input_source, target_lang="es", model_size="small",
     }
 
     # === Phase 2: Decision ===
-    on_progress(ProgressUpdate("decision",
-        f"\n{'=' * 60}\n  PHASE 2: DECISION\n{'=' * 60}", 0.5))
+    tracker.begin("Planning actions")
 
     actions = decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs,
                              target_lang, width, height, sub_lang)
     result["actions"] = actions
 
     plan_text = _format_plan(actions, video_path, dry_run=dry_run)
-    on_progress(ProgressUpdate("decision", plan_text, 0.55))
+    on_progress(ProgressUpdate("decision", plan_text, -1))
+
+    # Determine which execution steps are needed and skip the rest
+    sub_action = next(
+        (a for a in actions
+         if a["type"] in ("transcribe_only", "ocr_sync_translate", "whisper_translate")),
+        None,
+    )
+    needs_convert = any(a["type"] == "convert" for a in actions)
+    needs_subs = sub_action is not None
+    needs_translate = sub_action and sub_action["type"] == "whisper_translate"
+
+    if not needs_subs:
+        tracker.skip("Analyzing subtitle placement")
+        tracker.skip("Transcribing audio")
+        tracker.skip("Translating subtitles")
+        tracker.skip("Generating subtitle files")
+        if not needs_convert:
+            tracker.skip("Encoding video")
+    else:
+        if not needs_translate:
+            tracker.skip("Translating subtitles")
+
+    tracker.finish("Planning actions")
 
     if dry_run:
-        on_progress(ProgressUpdate("done", "Dry run complete — no changes made.", 1.0))
+        tracker.done()
         result["status"] = "dry_run"
         return result
 
     # === Phase 3: Execution ===
-    on_progress(ProgressUpdate("execution",
-        f"{'=' * 60}\n  PHASE 3: EXECUTION\n{'=' * 60}", 0.6))
-
     final_file, paths = execute_pipeline(
         video_path, actions, target_lang, audio_lang,
         whisper_model, width, height, ffmpeg, ffprobe,
-        base_dir=base_dir, on_progress=on_progress,
+        base_dir=base_dir, on_progress=on_progress, tracker=tracker,
     )
 
     result.update(paths)
     result["status"] = "completed"
 
-    on_progress(ProgressUpdate("done",
-        f"\n{'=' * 60}\n  DONE!\n  Final file: {final_file}\n{'=' * 60}", 1.0))
+    tracker.done()
+    on_progress(ProgressUpdate("done", f"  Final file: {final_file}", 1.0))
 
     return result
 
