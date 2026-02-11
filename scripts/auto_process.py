@@ -872,11 +872,15 @@ def main():
         "--no-convert", action="store_true",
         help="Skip portrait-to-10:9 conversion",
     )
+    ap.add_argument(
+        "--no-subs", action="store_true",
+        help="Skip subtitles entirely (no Whisper/OCR)",
+    )
     args = ap.parse_args()
 
     result = process_video(
         args.input,
-        target_lang=args.target_lang,
+        target_lang=None if args.no_subs else args.target_lang,
         model_size=args.model,
         dry_run=args.dry_run,
         convert_portrait=not args.no_convert,
