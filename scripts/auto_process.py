@@ -72,6 +72,46 @@ def _detect_language(video_path, model):
     return detect_language_quick(video_path, model=model)
 
 
+def _check_existing_subs(video_path, base_dir):
+    """Check if an SRT file already exists for this video and detect its language.
+
+    Returns (srt_path, detected_lang) or (None, None) if no SRT found.
+    """
+    from langdetect import detect, LangDetectException
+
+    basename = os.path.splitext(os.path.basename(video_path))[0]
+    srt_path = os.path.join(base_dir, "subbed", f"{basename}.srt")
+
+    if not os.path.isfile(srt_path):
+        return None, None
+
+    with open(srt_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Extract text lines (skip sequence numbers and timestamps)
+    text_lines = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r'^\d+$', line):
+            continue
+        if re.match(r'\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}', line):
+            continue
+        text_lines.append(line)
+
+    combined = " ".join(text_lines)
+    if len(combined) < 20:
+        return srt_path, None
+
+    try:
+        detected = detect(combined)
+    except LangDetectException:
+        return srt_path, None
+
+    return srt_path, detected
+
+
 def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
     """
     Quick OCR sample: extract ~10 frames from the bottom subtitle region,
@@ -141,7 +181,8 @@ def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
 # ---------------------------------------------------------------------------
 
 def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_lang,
-                   width, height, sub_lang=None, convert_portrait=True):
+                   width, height, sub_lang=None, convert_portrait=True,
+                   existing_srt_lang=None):
     """
     Decision matrix:
       Audio Language | Has Burned-in Subs | Subs Language | Action
@@ -186,6 +227,14 @@ def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_la
             "type": "skip_convert",
             "reason": f"Landscape video ({width}x{height}, ratio {actual_ratio:.4f}) — skipping 10:9 conversion",
         })
+
+    # If existing SRT already matches target language, skip subtitle generation
+    if existing_srt_lang == target_lang:
+        actions.append({
+            "type": "skip_subs",
+            "reason": f"Subtitles already exist in '{existing_srt_lang}'",
+        })
+        return actions
 
     audio_is_target = (audio_lang == target_lang)
     subs_are_target = (sub_lang == target_lang) if sub_lang else False
@@ -685,12 +734,24 @@ def process_video(input_source, target_lang="es", model_size="small",
     if not os.path.isfile(ffprobe):
         ffprobe = "ffprobe"
 
+    # --- Check for existing subtitles before expensive work ---
+    existing_srt_lang = None
+    if target_lang is not None and not is_url(input_source):
+        video_path_resolved = os.path.abspath(input_source)
+        srt_path, detected_lang = _check_existing_subs(video_path_resolved, base_dir)
+        if detected_lang == target_lang:
+            existing_srt_lang = detected_lang
+            on_progress(ProgressUpdate("assessment",
+                f"  Existing subtitles found: {srt_path} (detected: {detected_lang})"
+                f" — skipping subtitle generation", -1))
+
     # --- Build step tracker ---
+    skip_whisper = target_lang is None or existing_srt_lang is not None
     tracker = StepTracker(on_progress)
     if is_url(input_source):
         tracker.add_step("Downloading video", weight=15)
     tracker.add_step("Analyzing video", weight=2)
-    if target_lang is not None:
+    if not skip_whisper:
         tracker.add_step("Loading Whisper model", weight=8)
         tracker.add_step("Detecting language & scanning subtitles", weight=10)
     tracker.add_step("Planning actions", weight=1)
@@ -738,13 +799,16 @@ def process_video(input_source, target_lang="es", model_size="small",
             f"  Embedded subtitle streams: {len(subtitle_streams)}", -1))
     tracker.finish("Analyzing video")
 
-    # Load Whisper model + detect language/subs (skip when subtitles disabled)
-    if target_lang is None:
+    # Load Whisper model + detect language/subs (skip when subtitles disabled or existing SRT matches)
+    if skip_whisper:
         whisper_model = None
         audio_lang = None
         has_burned_subs = False
         sub_lang = None
-        on_progress(ProgressUpdate("assessment", "  Subtitles disabled — skipping Whisper/OCR", -1))
+        if target_lang is None:
+            on_progress(ProgressUpdate("assessment", "  Subtitles disabled — skipping Whisper/OCR", -1))
+        else:
+            on_progress(ProgressUpdate("assessment", "  Existing SRT matches target — skipping Whisper/OCR", -1))
 
         result["assessment"] = {
             "width": width, "height": height, "duration": duration,
@@ -797,7 +861,8 @@ def process_video(input_source, target_lang="es", model_size="small",
 
     actions = decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs,
                              target_lang, width, height, sub_lang,
-                             convert_portrait=convert_portrait)
+                             convert_portrait=convert_portrait,
+                             existing_srt_lang=existing_srt_lang)
     result["actions"] = actions
 
     plan_text = _format_plan(actions, video_path, dry_run=dry_run)
