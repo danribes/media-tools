@@ -156,6 +156,20 @@ def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_la
     """
     actions = []
 
+    # When subtitles are disabled, only consider conversion
+    if target_lang is None:
+        is_portrait = height > width
+        if not is_10_9 and is_portrait and convert_portrait:
+            actions.append({
+                "type": "convert",
+                "reason": f"Portrait video ({width}x{height}, ratio {actual_ratio:.4f}) — stretch to 10:9",
+            })
+        actions.append({
+            "type": "skip_subs",
+            "reason": "Subtitles disabled by user",
+        })
+        return actions
+
     is_portrait = height > width
     if not is_10_9 and is_portrait and convert_portrait:
         actions.append({
@@ -676,8 +690,9 @@ def process_video(input_source, target_lang="es", model_size="small",
     if is_url(input_source):
         tracker.add_step("Downloading video", weight=15)
     tracker.add_step("Analyzing video", weight=2)
-    tracker.add_step("Loading Whisper model", weight=8)
-    tracker.add_step("Detecting language & scanning subtitles", weight=10)
+    if target_lang is not None:
+        tracker.add_step("Loading Whisper model", weight=8)
+        tracker.add_step("Detecting language & scanning subtitles", weight=10)
     tracker.add_step("Planning actions", weight=1)
     tracker.add_step("Analyzing subtitle placement", weight=5)
     tracker.add_step("Transcribing audio", weight=30)
@@ -723,43 +738,59 @@ def process_video(input_source, target_lang="es", model_size="small",
             f"  Embedded subtitle streams: {len(subtitle_streams)}", -1))
     tracker.finish("Analyzing video")
 
-    # Load Whisper model once (with GPU auto-detection)
-    tracker.begin("Loading Whisper model")
-    whisper_model = load_whisper_model(model_size,
-        log=lambda m: on_progress(ProgressUpdate("assessment", m, -1)))
-    tracker.finish("Loading Whisper model")
+    # Load Whisper model + detect language/subs (skip when subtitles disabled)
+    if target_lang is None:
+        whisper_model = None
+        audio_lang = None
+        has_burned_subs = False
+        sub_lang = None
+        on_progress(ProgressUpdate("assessment", "  Subtitles disabled — skipping Whisper/OCR", -1))
 
-    # Parallel: language detection + OCR sampling
-    tracker.begin("Detecting language & scanning subtitles")
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        lang_future = executor.submit(
-            _detect_language, video_path, whisper_model,
-        )
-        ocr_future = executor.submit(
-            _quick_ocr_sample, video_path, ffmpeg, width, height, duration,
-        )
+        result["assessment"] = {
+            "width": width, "height": height, "duration": duration,
+            "is_10_9": is_10_9, "actual_ratio": actual_ratio,
+            "audio_lang": None, "lang_prob": 0.0,
+            "has_burned_subs": False, "sub_lang": None,
+            "readable_frames": 0, "total_frames": 0,
+            "subtitle_streams": len(subtitle_streams),
+        }
+    else:
+        tracker.begin("Loading Whisper model")
+        whisper_model = load_whisper_model(model_size,
+            log=lambda m: on_progress(ProgressUpdate("assessment", m, -1)))
+        tracker.finish("Loading Whisper model")
 
-        audio_lang, lang_prob = lang_future.result()
-        has_burned_subs, readable, total, sub_lang = ocr_future.result()
+        # Parallel: language detection + OCR sampling
+        tracker.begin("Detecting language & scanning subtitles")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            lang_future = executor.submit(
+                _detect_language, video_path, whisper_model,
+            )
+            ocr_future = executor.submit(
+                _quick_ocr_sample, video_path, ffmpeg, width, height, duration,
+            )
 
-    on_progress(ProgressUpdate("assessment",
-        f"  Audio language: {audio_lang} (confidence: {lang_prob:.2f})", -1))
-    on_progress(ProgressUpdate("assessment",
-        f"  Burned-in subs: {'YES' if has_burned_subs else 'NO'} "
-        f"({readable}/{total} frames with readable text)", -1))
-    if sub_lang:
+            audio_lang, lang_prob = lang_future.result()
+            has_burned_subs, readable, total, sub_lang = ocr_future.result()
+
         on_progress(ProgressUpdate("assessment",
-            f"  Burned-in subs language: {sub_lang}", -1))
-    tracker.finish("Detecting language & scanning subtitles")
+            f"  Audio language: {audio_lang} (confidence: {lang_prob:.2f})", -1))
+        on_progress(ProgressUpdate("assessment",
+            f"  Burned-in subs: {'YES' if has_burned_subs else 'NO'} "
+            f"({readable}/{total} frames with readable text)", -1))
+        if sub_lang:
+            on_progress(ProgressUpdate("assessment",
+                f"  Burned-in subs language: {sub_lang}", -1))
+        tracker.finish("Detecting language & scanning subtitles")
 
-    result["assessment"] = {
-        "width": width, "height": height, "duration": duration,
-        "is_10_9": is_10_9, "actual_ratio": actual_ratio,
-        "audio_lang": audio_lang, "lang_prob": lang_prob,
-        "has_burned_subs": has_burned_subs, "sub_lang": sub_lang,
-        "readable_frames": readable, "total_frames": total,
-        "subtitle_streams": len(subtitle_streams),
-    }
+        result["assessment"] = {
+            "width": width, "height": height, "duration": duration,
+            "is_10_9": is_10_9, "actual_ratio": actual_ratio,
+            "audio_lang": audio_lang, "lang_prob": lang_prob,
+            "has_burned_subs": has_burned_subs, "sub_lang": sub_lang,
+            "readable_frames": readable, "total_frames": total,
+            "subtitle_streams": len(subtitle_streams),
+        }
 
     # === Phase 2: Decision ===
     tracker.begin("Planning actions")

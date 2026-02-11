@@ -92,17 +92,12 @@ def main():
     # --- Sidebar settings ---
     with st.sidebar:
         st.header("Settings")
-        target_lang = st.selectbox("Target language", [
-            ("es", "Spanish"),
-            ("en", "English"),
-            ("pt", "Portuguese"),
-            ("fr", "French"),
-            ("de", "German"),
-            ("it", "Italian"),
-            ("ja", "Japanese"),
-            ("ko", "Korean"),
-            ("zh", "Chinese"),
-        ], format_func=lambda x: f"{x[1]} ({x[0]})", index=0)[0]
+        subtitle_mode = st.radio("Subtitles", [
+            "Spanish (es)",
+            "English (en)",
+            "No subtitles",
+        ], index=0)
+        target_lang = {"Spanish (es)": "es", "English (en)": "en", "No subtitles": None}[subtitle_mode]
 
         model_size = st.selectbox("Whisper model", [
             "tiny", "base", "small", "medium", "large",
