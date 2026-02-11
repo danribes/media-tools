@@ -24,31 +24,46 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def init_session_state():
     """Initialize session state variables."""
     defaults = {
-        "progress_log": [],
         "processing": False,
         "result": None,
         "error": None,
-        "step_info": None,
-        "processing_start": None,
+        "progress_log": [],
+        # Plain dict shared with background thread.  st.session_state is
+        # thread-local in Streamlit so the worker writes here instead.
+        "shared": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
-def progress_callback(update: ProgressUpdate):
-    """Thread-safe callback that appends to session state progress log."""
-    if update.phase == "step":
-        st.session_state.step_info = {
-            "name": update.message,
-            "percent": update.percent,
-            **update.detail,
-        }
-    st.session_state.progress_log.append(update)
+def _make_shared():
+    """Create the plain dict used for cross-thread communication."""
+    return {
+        "progress_log": [],
+        "step_info": None,
+        "processing": True,
+        "result": None,
+        "error": None,
+        "start_time": time.time(),
+    }
 
 
-def run_processing(input_source, target_lang, model_size, dry_run):
-    """Run process_video in a thread, storing result/error in session state."""
+def _make_callback(shared):
+    """Return a progress callback that writes to the shared dict."""
+    def progress_callback(update: ProgressUpdate):
+        if update.phase == "step":
+            shared["step_info"] = {
+                "name": update.message,
+                "percent": update.percent,
+                **update.detail,
+            }
+        shared["progress_log"].append(update)
+    return progress_callback
+
+
+def _run_processing(shared, input_source, target_lang, model_size, dry_run):
+    """Run process_video in a thread, storing result/error in shared dict."""
     try:
         result = process_video(
             input_source,
@@ -56,13 +71,13 @@ def run_processing(input_source, target_lang, model_size, dry_run):
             model_size=model_size,
             dry_run=dry_run,
             base_dir=BASE_DIR,
-            on_progress=progress_callback,
+            on_progress=_make_callback(shared),
         )
-        st.session_state.result = result
+        shared["result"] = result
     except Exception as e:
-        st.session_state.error = str(e)
+        shared["error"] = str(e)
     finally:
-        st.session_state.processing = False
+        shared["processing"] = False
 
 
 def main():
@@ -124,83 +139,70 @@ def main():
             st.error("Provide a URL or upload a file first.")
         else:
             # Reset state
-            st.session_state.progress_log = []
             st.session_state.result = None
             st.session_state.error = None
-            st.session_state.step_info = None
+            st.session_state.progress_log = []
             st.session_state.processing = True
-            st.session_state.processing_start = time.time()
+
+            shared = _make_shared()
+            st.session_state.shared = shared
 
             thread = threading.Thread(
-                target=run_processing,
-                args=(input_source, target_lang, model_size, dry_run),
+                target=_run_processing,
+                args=(shared, input_source, target_lang, model_size, dry_run),
                 daemon=True,
             )
             thread.start()
             st.rerun()
 
-    # --- Progress display ---
-    if st.session_state.processing:
-        progress_bar = st.progress(0, text="Starting...")
-        status = st.status("Processing log", expanded=False)
-        last_count = 0
+    # --- Progress display (rerun-based polling) ---
+    shared = st.session_state.shared
+    if st.session_state.processing and shared:
+        # Check if the background thread has finished
+        if not shared["processing"]:
+            # Transfer results to session state and do a final rerun
+            st.session_state.result = shared["result"]
+            st.session_state.error = shared["error"]
+            st.session_state.progress_log = list(shared["progress_log"])
+            st.session_state.processing = False
+            st.session_state.shared = None
+            st.rerun()
 
-        while st.session_state.processing:
-            # Update progress bar from step info with real-time elapsed
-            step = st.session_state.step_info
-            if step:
-                real_elapsed = time.time() - st.session_state.processing_start
-                elapsed_str = format_time(real_elapsed)
-                if step["remaining"] >= 0:
-                    time_since_update = real_elapsed - step["elapsed"]
-                    adjusted_remaining = max(0, step["remaining"] - time_since_update)
-                    remaining_str = f"~{format_time(adjusted_remaining)} remaining"
-                else:
-                    remaining_str = "estimating..."
-                text = (f"Step {step['step']}/{step['total']}: "
-                        f"{step['name']}  \u2014  "
-                        f"{elapsed_str} elapsed, {remaining_str}")
-                progress_bar.progress(
-                    min(step.get("percent", 0), 0.99), text=text)
-
-            # Update detail log
-            log = st.session_state.progress_log
-            if len(log) > last_count:
-                for update in log[last_count:]:
-                    if update.phase == "step":
-                        continue
-                    msg = update.message.strip()
-                    if msg:
-                        status.write(msg)
-                last_count = len(log)
-            time.sleep(0.3)
-
-        # Flush remaining messages
-        log = st.session_state.progress_log
-        for update in log[last_count:]:
-            if update.phase == "step":
-                continue
-            msg = update.message.strip()
-            if msg:
-                status.write(msg)
-
-        # Final state
-        real_elapsed = time.time() - st.session_state.processing_start
-        elapsed_str = format_time(real_elapsed)
-        if st.session_state.error:
-            progress_bar.progress(1.0, text=f"Error after {elapsed_str}")
-            status.update(label="Processing log", state="error")
+        # -- Render current progress --
+        step = shared["step_info"]
+        if step:
+            real_elapsed = time.time() - shared["start_time"]
+            elapsed_str = format_time(real_elapsed)
+            if step["remaining"] >= 0:
+                time_since_update = real_elapsed - step["elapsed"]
+                adjusted_remaining = max(0, step["remaining"] - time_since_update)
+                remaining_str = f"~{format_time(adjusted_remaining)} remaining"
+            else:
+                remaining_str = "estimating..."
+            text = (f"Step {step['step']}/{step['total']}: "
+                    f"{step['name']}  \u2014  "
+                    f"{elapsed_str} elapsed, {remaining_str}")
+            st.progress(min(step.get("percent", 0), 0.99), text=text)
         else:
-            progress_bar.progress(1.0, text=f"Complete! ({elapsed_str})")
-            status.update(label="Processing log", state="complete")
+            st.progress(0, text="Starting...")
 
+        # Show processing log so far
+        log = shared["progress_log"]
+        detail_msgs = [u.message.strip() for u in log
+                       if u.phase != "step" and u.message.strip()]
+        if detail_msgs:
+            with st.expander("Processing log", expanded=True):
+                for msg in detail_msgs:
+                    st.text(msg)
+
+        # Poll again after a short delay
+        time.sleep(0.5)
         st.rerun()
 
     # --- Error display ---
     if st.session_state.error:
         st.error(f"Processing failed: {st.session_state.error}")
 
-        # Still show log
         with st.expander("Processing log", expanded=False):
             for update in st.session_state.progress_log:
                 if update.phase == "step":
