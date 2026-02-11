@@ -359,7 +359,7 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
     ]
 
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, capture_output=True)
     finally:
         os.unlink(tmp_ass.name)
 

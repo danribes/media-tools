@@ -505,7 +505,7 @@ def burn_subtitles(video_path, ass_path, output_path, ffmpeg_path):
     ]
 
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, capture_output=True)
     finally:
         os.unlink(tmp_ass.name)
 

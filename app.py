@@ -29,6 +29,7 @@ def init_session_state():
         "result": None,
         "error": None,
         "step_info": None,
+        "processing_start": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -128,6 +129,7 @@ def main():
             st.session_state.error = None
             st.session_state.step_info = None
             st.session_state.processing = True
+            st.session_state.processing_start = time.time()
 
             thread = threading.Thread(
                 target=run_processing,
@@ -144,12 +146,15 @@ def main():
         last_count = 0
 
         while st.session_state.processing:
-            # Update progress bar from step info
+            # Update progress bar from step info with real-time elapsed
             step = st.session_state.step_info
             if step:
-                elapsed_str = format_time(step["elapsed"])
+                real_elapsed = time.time() - st.session_state.processing_start
+                elapsed_str = format_time(real_elapsed)
                 if step["remaining"] >= 0:
-                    remaining_str = f"~{format_time(step['remaining'])} remaining"
+                    time_since_update = real_elapsed - step["elapsed"]
+                    adjusted_remaining = max(0, step["remaining"] - time_since_update)
+                    remaining_str = f"~{format_time(adjusted_remaining)} remaining"
                 else:
                     remaining_str = "estimating..."
                 text = (f"Step {step['step']}/{step['total']}: "
@@ -180,13 +185,12 @@ def main():
                 status.write(msg)
 
         # Final state
-        step = st.session_state.step_info
+        real_elapsed = time.time() - st.session_state.processing_start
+        elapsed_str = format_time(real_elapsed)
         if st.session_state.error:
-            elapsed_str = format_time(step["elapsed"]) if step else "0s"
             progress_bar.progress(1.0, text=f"Error after {elapsed_str}")
             status.update(label="Processing log", state="error")
         else:
-            elapsed_str = format_time(step["elapsed"]) if step else "0s"
             progress_bar.progress(1.0, text=f"Complete! ({elapsed_str})")
             status.update(label="Processing log", state="complete")
 
