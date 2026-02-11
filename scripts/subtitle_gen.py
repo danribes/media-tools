@@ -387,9 +387,20 @@ def transcribe_audio(video_path, language, model_size, model=None, log=print):
 # Translation
 # ---------------------------------------------------------------------------
 
+_GOOGLE_LANG_MAP = {
+    "zh": "zh-CN",
+    "he": "iw",
+    "jw": "jv",
+}
+
+
 def translate_segments(segments, source_lang, target_lang="es", log=print):
     """Translate subtitle text using deep-translator (Google free API)."""
     from deep_translator import GoogleTranslator
+
+    # Normalize language codes for GoogleTranslator compatibility
+    source_lang = _GOOGLE_LANG_MAP.get(source_lang, source_lang)
+    target_lang = _GOOGLE_LANG_MAP.get(target_lang, target_lang)
 
     log(f"  Translating {len(segments)} segments: {source_lang} -> {target_lang}")
     translator = GoogleTranslator(source=source_lang, target=target_lang)

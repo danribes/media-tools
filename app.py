@@ -62,7 +62,8 @@ def _make_callback(shared):
     return progress_callback
 
 
-def _run_processing(shared, input_source, target_lang, model_size, dry_run):
+def _run_processing(shared, input_source, target_lang, model_size, dry_run,
+                    convert_portrait=True):
     """Run process_video in a thread, storing result/error in shared dict."""
     try:
         result = process_video(
@@ -72,6 +73,7 @@ def _run_processing(shared, input_source, target_lang, model_size, dry_run):
             dry_run=dry_run,
             base_dir=BASE_DIR,
             on_progress=_make_callback(shared),
+            convert_portrait=convert_portrait,
         )
         shared["result"] = result
     except Exception as e:
@@ -105,6 +107,8 @@ def main():
         model_size = st.selectbox("Whisper model", [
             "tiny", "base", "small", "medium", "large",
         ], index=2)
+
+        convert_portrait = st.checkbox("Convert portrait to 10:9", value=True)
 
         dry_run = st.checkbox("Dry run (assess only)", value=False)
 
@@ -149,7 +153,8 @@ def main():
 
             thread = threading.Thread(
                 target=_run_processing,
-                args=(shared, input_source, target_lang, model_size, dry_run),
+                args=(shared, input_source, target_lang, model_size, dry_run,
+                      convert_portrait),
                 daemon=True,
             )
             thread.start()

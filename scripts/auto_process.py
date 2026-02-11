@@ -141,7 +141,7 @@ def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
 # ---------------------------------------------------------------------------
 
 def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_lang,
-                   width, height, sub_lang=None):
+                   width, height, sub_lang=None, convert_portrait=True):
     """
     Decision matrix:
       Audio Language | Has Burned-in Subs | Subs Language | Action
@@ -157,10 +157,15 @@ def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_la
     actions = []
 
     is_portrait = height > width
-    if not is_10_9 and is_portrait:
+    if not is_10_9 and is_portrait and convert_portrait:
         actions.append({
             "type": "convert",
             "reason": f"Portrait video ({width}x{height}, ratio {actual_ratio:.4f}) — stretch to 10:9",
+        })
+    elif not is_10_9 and is_portrait and not convert_portrait:
+        actions.append({
+            "type": "skip_convert",
+            "reason": f"Portrait video ({width}x{height}, ratio {actual_ratio:.4f}) — keeping original format",
         })
     elif not is_10_9 and not is_portrait:
         actions.append({
@@ -633,7 +638,7 @@ def is_url(s):
 
 def process_video(input_source, target_lang="es", model_size="small",
                   dry_run=False, base_dir=None,
-                  on_progress=print_progress):
+                  on_progress=print_progress, convert_portrait=True):
     """
     Main entry point for the auto-process pipeline.
 
@@ -760,7 +765,8 @@ def process_video(input_source, target_lang="es", model_size="small",
     tracker.begin("Planning actions")
 
     actions = decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs,
-                             target_lang, width, height, sub_lang)
+                             target_lang, width, height, sub_lang,
+                             convert_portrait=convert_portrait)
     result["actions"] = actions
 
     plan_text = _format_plan(actions, video_path, dry_run=dry_run)
@@ -831,6 +837,10 @@ def main():
         "--dry-run", action="store_true",
         help="Assess only — show plan without executing",
     )
+    ap.add_argument(
+        "--no-convert", action="store_true",
+        help="Skip portrait-to-10:9 conversion",
+    )
     args = ap.parse_args()
 
     result = process_video(
@@ -838,6 +848,7 @@ def main():
         target_lang=args.target_lang,
         model_size=args.model,
         dry_run=args.dry_run,
+        convert_portrait=not args.no_convert,
     )
 
     if result["status"] == "error":
