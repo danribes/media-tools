@@ -66,7 +66,7 @@ def _make_callback(shared):
 
 
 def _run_processing(shared, input_source, target_lang, model_size, dry_run,
-                    convert_portrait=True):
+                    convert_portrait=True, dub_audio=False):
     """Run process_video in a thread, storing result/error in shared dict."""
     try:
         result = process_video(
@@ -77,6 +77,7 @@ def _run_processing(shared, input_source, target_lang, model_size, dry_run,
             base_dir=BASE_DIR,
             on_progress=_make_callback(shared),
             convert_portrait=convert_portrait,
+            dub_audio=dub_audio,
         )
         shared["result"] = result
     except UnsupportedLanguageError as e:
@@ -105,10 +106,17 @@ def main():
         target_lang = {"Spanish (es)": "es", "English (en)": "en", "No subtitles": None}[subtitle_mode]
 
         if target_lang is not None:
+            output_mode = st.radio("Output mode", [
+                "Subtitles (keep original audio)",
+                "Audio dub (replace with TTS audio)",
+            ])
+            dub_audio = output_mode == "Audio dub (replace with TTS audio)"
+
             model_size = st.selectbox("Whisper model", [
                 "tiny", "base", "small", "medium", "large",
             ], index=2)
         else:
+            dub_audio = False
             model_size = "small"
 
         convert_portrait = st.checkbox("Convert portrait to 10:9", value=True)
@@ -158,7 +166,7 @@ def main():
             thread = threading.Thread(
                 target=_run_processing,
                 args=(shared, input_source, target_lang, model_size, dry_run,
-                      convert_portrait),
+                      convert_portrait, dub_audio),
                 daemon=True,
             )
             thread.start()
@@ -230,7 +238,7 @@ def main():
                 thread = threading.Thread(
                     target=_run_processing,
                     args=(shared, input_source, None, model_size, dry_run,
-                          convert_portrait),
+                          convert_portrait, False),
                     daemon=True,
                 )
                 thread.start()

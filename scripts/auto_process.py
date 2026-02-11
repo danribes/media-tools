@@ -47,6 +47,7 @@ from subtitle_gen import (
     load_whisper_model,
     ocr_frame,
     save_srt,
+    synthesize_dubbed_audio,
     transcribe_audio,
     translate_segments,
 )
@@ -443,9 +444,48 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
         os.unlink(tmp_ass.name)
 
 
+def _ffmpeg_encode_with_dub(input_path, wav_path, ass_path, output_path,
+                            scale_w=None, scale_h=None, ffmpeg_path="ffmpeg"):
+    """Encode video with dubbed audio WAV, optionally scaling + burning subtitles."""
+    tmp_ass = tempfile.NamedTemporaryFile(
+        suffix=".ass", delete=False, prefix="subs_",
+    )
+    tmp_ass.close()
+    with open(ass_path, "rb") as src, open(tmp_ass.name, "wb") as dst:
+        dst.write(src.read())
+
+    escaped = tmp_ass.name.replace("\\", "/").replace(":", "\\:")
+
+    # Build video filter chain
+    vf_parts = []
+    if scale_w and scale_h:
+        vf_parts.append(f"scale={scale_w}:{scale_h},setsar=1")
+    vf_parts.append(f"ass={escaped}")
+    vf_str = ",".join(vf_parts)
+
+    cmd = [
+        ffmpeg_path,
+        "-i", input_path,
+        "-i", wav_path,
+        "-map", "0:v",
+        "-map", "1:a",
+        "-vf", vf_str,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-y", output_path,
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    finally:
+        os.unlink(tmp_ass.name)
+
+
 def execute_pipeline(video_path, actions, target_lang, audio_lang,
                      whisper_model, width, height, ffmpeg, ffprobe,
-                     base_dir=None, on_progress=print_progress, tracker=None):
+                     base_dir=None, on_progress=print_progress, tracker=None,
+                     duration=0, dub_audio=False):
     """
     Execute the decided actions using direct Python calls.
     Combines convert + burn into a single ffmpeg pass when both are needed.
@@ -497,6 +537,7 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
             sub_action = None
             if tracker:
                 tracker.skip("Generating subtitle files")
+                tracker.skip("Synthesizing audio")
                 if not needs_convert:
                     tracker.skip("Encoding video")
 
@@ -524,9 +565,34 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
         result_paths["output_srt"] = srt_path
         result_paths["output_ass"] = ass_path
 
+        # --- Synthesize dubbed audio if requested ---
+        wav_path = None
+        if dub_audio:
+            if tracker:
+                tracker.begin("Synthesizing audio")
+            _log("  Synthesizing TTS audio...")
+            wav_path = os.path.join(out_dir, f"{basename}_dub.wav")
+            synthesize_dubbed_audio(
+                segments, target_lang, duration, wav_path, ffmpeg,
+                log=lambda m: _log(m),
+            )
+            if tracker:
+                tracker.finish("Synthesizing audio")
+        else:
+            if tracker:
+                tracker.skip("Synthesizing audio")
+
         if tracker:
             tracker.begin("Encoding video")
-        if needs_convert:
+        if dub_audio and wav_path:
+            scale_w = target_w if needs_convert else None
+            scale_h = target_h if needs_convert else None
+            _log("  Encoding video with dubbed audio...")
+            _ffmpeg_encode_with_dub(
+                video_path, wav_path, ass_path, output_path,
+                scale_w=scale_w, scale_h=scale_h, ffmpeg_path=ffmpeg,
+            )
+        elif needs_convert:
             _log(f"  Encoding: scale {width}x{height} -> "
                  f"{target_w}x{target_h} + burn subtitles...")
             _ffmpeg_convert_and_burn(
@@ -701,7 +767,8 @@ def is_url(s):
 
 def process_video(input_source, target_lang="es", model_size="small",
                   dry_run=False, base_dir=None,
-                  on_progress=print_progress, convert_portrait=True):
+                  on_progress=print_progress, convert_portrait=True,
+                  dub_audio=False):
     """
     Main entry point for the auto-process pipeline.
 
@@ -759,6 +826,7 @@ def process_video(input_source, target_lang="es", model_size="small",
     tracker.add_step("Transcribing audio", weight=30)
     tracker.add_step("Translating subtitles", weight=8)
     tracker.add_step("Generating subtitle files", weight=1)
+    tracker.add_step("Synthesizing audio", weight=20)
     tracker.add_step("Encoding video", weight=25)
 
     result = {
@@ -883,11 +951,14 @@ def process_video(input_source, target_lang="es", model_size="small",
         tracker.skip("Transcribing audio")
         tracker.skip("Translating subtitles")
         tracker.skip("Generating subtitle files")
+        tracker.skip("Synthesizing audio")
         if not needs_convert:
             tracker.skip("Encoding video")
     else:
         if not needs_translate:
             tracker.skip("Translating subtitles")
+        if not dub_audio:
+            tracker.skip("Synthesizing audio")
 
     tracker.finish("Planning actions")
 
@@ -901,6 +972,7 @@ def process_video(input_source, target_lang="es", model_size="small",
         video_path, actions, target_lang, audio_lang,
         whisper_model, width, height, ffmpeg, ffprobe,
         base_dir=base_dir, on_progress=on_progress, tracker=tracker,
+        duration=duration, dub_audio=dub_audio,
     )
 
     result.update(paths)
@@ -941,6 +1013,10 @@ def main():
         "--no-subs", action="store_true",
         help="Skip subtitles entirely (no Whisper/OCR)",
     )
+    ap.add_argument(
+        "--dub", action="store_true",
+        help="Replace audio with TTS-synthesized translated speech",
+    )
     args = ap.parse_args()
 
     result = process_video(
@@ -949,6 +1025,7 @@ def main():
         model_size=args.model,
         dry_run=args.dry_run,
         convert_portrait=not args.no_convert,
+        dub_audio=args.dub,
     )
 
     if result["status"] == "error":

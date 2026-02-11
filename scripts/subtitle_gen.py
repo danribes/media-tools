@@ -12,10 +12,12 @@ Workflow:
 """
 
 import argparse
+import asyncio
 import difflib
 import glob
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -426,6 +428,118 @@ def translate_segments(segments, source_lang, target_lang="es", log=print):
             log(f"  Warning: Translation failed for segment: {e}")
 
     return segments
+
+
+# ---------------------------------------------------------------------------
+# TTS audio dubbing (edge-tts)
+# ---------------------------------------------------------------------------
+
+_EDGE_TTS_VOICES = {
+    "es": "es-MX-JorgeNeural",
+    "en": "en-US-GuyNeural",
+}
+
+SAMPLE_RATE = 24000
+
+
+def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
+                            ffmpeg_path, log=print):
+    """Generate a full-length WAV with TTS speech placed at segment timestamps.
+
+    For each segment, edge-tts produces an MP3 which is decoded to raw PCM via
+    ffmpeg, then mixed (additive) into a silent buffer spanning the entire video
+    duration.  The result is written as a 16-bit WAV file.
+    """
+    import edge_tts
+
+    voice = _EDGE_TTS_VOICES.get(target_lang)
+    if not voice:
+        raise ValueError(
+            f"No TTS voice configured for language '{target_lang}'. "
+            f"Supported: {', '.join(sorted(_EDGE_TTS_VOICES))}"
+        )
+
+    total_samples = int(video_duration * SAMPLE_RATE)
+    mixed = np.zeros(total_samples, dtype=np.float32)
+
+    tmpdir = tempfile.mkdtemp(prefix="tts_dub_")
+    mp3_paths = []
+
+    try:
+        for i, seg in enumerate(segments):
+            text = seg["text"].strip()
+            if not text:
+                continue
+
+            mp3_path = os.path.join(tmpdir, f"seg_{i:04d}.mp3")
+            mp3_paths.append(mp3_path)
+
+            # Generate MP3 via edge-tts
+            comm = edge_tts.Communicate(text, voice)
+            asyncio.run(comm.save(mp3_path))
+
+            # Decode MP3 to raw PCM float32 via ffmpeg
+            cmd = [
+                ffmpeg_path, "-v", "error",
+                "-i", mp3_path,
+                "-f", "f32le",
+                "-acodec", "pcm_f32le",
+                "-ar", str(SAMPLE_RATE),
+                "-ac", "1",
+                "pipe:1",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, check=True)
+            pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+
+            # Place at the segment's start offset (additive mix)
+            offset = int(seg["start"] * SAMPLE_RATE)
+            end = min(offset + len(pcm), total_samples)
+            length = end - offset
+            if length > 0:
+                mixed[offset:end] += pcm[:length]
+
+            if (i + 1) % 10 == 0 or i + 1 == len(segments):
+                log(f"  TTS: {i + 1}/{len(segments)} segments synthesized")
+
+        # Clip to [-1, 1] and convert to int16
+        np.clip(mixed, -1.0, 1.0, out=mixed)
+        pcm_int16 = (mixed * 32767).astype(np.int16)
+
+        # Write WAV with manual 44-byte header
+        data_bytes = pcm_int16.tobytes()
+        num_channels = 1
+        sample_width = 2  # 16-bit
+        byte_rate = SAMPLE_RATE * num_channels * sample_width
+        block_align = num_channels * sample_width
+
+        with open(output_path, "wb") as f:
+            # RIFF header
+            f.write(b"RIFF")
+            f.write(struct.pack("<I", 36 + len(data_bytes)))
+            f.write(b"WAVE")
+            # fmt chunk
+            f.write(b"fmt ")
+            f.write(struct.pack("<I", 16))               # chunk size
+            f.write(struct.pack("<H", 1))                 # PCM format
+            f.write(struct.pack("<H", num_channels))
+            f.write(struct.pack("<I", SAMPLE_RATE))
+            f.write(struct.pack("<I", byte_rate))
+            f.write(struct.pack("<H", block_align))
+            f.write(struct.pack("<H", sample_width * 8))  # bits per sample
+            # data chunk
+            f.write(b"data")
+            f.write(struct.pack("<I", len(data_bytes)))
+            f.write(data_bytes)
+
+        log(f"  TTS WAV written: {output_path}")
+
+    finally:
+        # Clean up temp MP3 files
+        for p in mp3_paths:
+            if os.path.exists(p):
+                os.unlink(p)
+        if os.path.isdir(tmpdir):
+            os.rmdir(tmpdir)
 
 
 # ---------------------------------------------------------------------------
