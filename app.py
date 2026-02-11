@@ -66,7 +66,7 @@ def _make_callback(shared):
 
 
 def _run_processing(shared, input_source, target_lang, model_size, dry_run,
-                    convert_portrait=True, dub_audio=False):
+                    convert_portrait=True, dub_audio=False, voice_gender="male"):
     """Run process_video in a thread, storing result/error in shared dict."""
     try:
         result = process_video(
@@ -78,6 +78,7 @@ def _run_processing(shared, input_source, target_lang, model_size, dry_run,
             on_progress=_make_callback(shared),
             convert_portrait=convert_portrait,
             dub_audio=dub_audio,
+            voice_gender=voice_gender,
         )
         shared["result"] = result
     except UnsupportedLanguageError as e:
@@ -112,11 +113,20 @@ def main():
             ])
             dub_audio = output_mode == "Audio dub (replace with TTS audio)"
 
+            if dub_audio:
+                voice_gender = st.radio("Voice", [
+                    "Male", "Female",
+                ])
+                voice_gender = voice_gender.lower()
+            else:
+                voice_gender = "male"
+
             model_size = st.selectbox("Whisper model", [
                 "tiny", "base", "small", "medium", "large",
             ], index=2)
         else:
             dub_audio = False
+            voice_gender = "male"
             model_size = "small"
 
         convert_portrait = st.checkbox("Convert portrait to 10:9", value=True)
@@ -166,7 +176,7 @@ def main():
             thread = threading.Thread(
                 target=_run_processing,
                 args=(shared, input_source, target_lang, model_size, dry_run,
-                      convert_portrait, dub_audio),
+                      convert_portrait, dub_audio, voice_gender),
                 daemon=True,
             )
             thread.start()

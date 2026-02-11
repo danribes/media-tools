@@ -435,15 +435,15 @@ def translate_segments(segments, source_lang, target_lang="es", log=print):
 # ---------------------------------------------------------------------------
 
 _EDGE_TTS_VOICES = {
-    "es": "es-MX-JorgeNeural",
-    "en": "en-US-GuyNeural",
+    "es": {"male": "es-MX-JorgeNeural", "female": "es-MX-DaliaNeural"},
+    "en": {"male": "en-US-GuyNeural", "female": "en-US-JennyNeural"},
 }
 
 SAMPLE_RATE = 24000
 
 
 def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
-                            ffmpeg_path, log=print):
+                            ffmpeg_path, voice_gender="male", log=print):
     """Generate a full-length WAV with TTS speech placed at segment timestamps.
 
     For each segment, edge-tts produces an MP3 which is decoded to raw PCM via
@@ -452,12 +452,13 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
     """
     import edge_tts
 
-    voice = _EDGE_TTS_VOICES.get(target_lang)
-    if not voice:
+    lang_voices = _EDGE_TTS_VOICES.get(target_lang)
+    if not lang_voices:
         raise ValueError(
             f"No TTS voice configured for language '{target_lang}'. "
             f"Supported: {', '.join(sorted(_EDGE_TTS_VOICES))}"
         )
+    voice = lang_voices.get(voice_gender, lang_voices["male"])
 
     total_samples = int(video_duration * SAMPLE_RATE)
     mixed = np.zeros(total_samples, dtype=np.float32)

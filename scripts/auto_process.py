@@ -485,7 +485,7 @@ def _ffmpeg_encode_with_dub(input_path, wav_path, ass_path, output_path,
 def execute_pipeline(video_path, actions, target_lang, audio_lang,
                      whisper_model, width, height, ffmpeg, ffprobe,
                      base_dir=None, on_progress=print_progress, tracker=None,
-                     duration=0, dub_audio=False):
+                     duration=0, dub_audio=False, voice_gender="male"):
     """
     Execute the decided actions using direct Python calls.
     Combines convert + burn into a single ffmpeg pass when both are needed.
@@ -574,7 +574,7 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
             wav_path = os.path.join(out_dir, f"{basename}_dub.wav")
             synthesize_dubbed_audio(
                 segments, target_lang, duration, wav_path, ffmpeg,
-                log=lambda m: _log(m),
+                voice_gender=voice_gender, log=lambda m: _log(m),
             )
             if tracker:
                 tracker.finish("Synthesizing audio")
@@ -768,7 +768,7 @@ def is_url(s):
 def process_video(input_source, target_lang="es", model_size="small",
                   dry_run=False, base_dir=None,
                   on_progress=print_progress, convert_portrait=True,
-                  dub_audio=False):
+                  dub_audio=False, voice_gender="male"):
     """
     Main entry point for the auto-process pipeline.
 
@@ -972,7 +972,7 @@ def process_video(input_source, target_lang="es", model_size="small",
         video_path, actions, target_lang, audio_lang,
         whisper_model, width, height, ffmpeg, ffprobe,
         base_dir=base_dir, on_progress=on_progress, tracker=tracker,
-        duration=duration, dub_audio=dub_audio,
+        duration=duration, dub_audio=dub_audio, voice_gender=voice_gender,
     )
 
     result.update(paths)
@@ -1017,6 +1017,10 @@ def main():
         "--dub", action="store_true",
         help="Replace audio with TTS-synthesized translated speech",
     )
+    ap.add_argument(
+        "--voice", choices=["male", "female"], default="male",
+        help="TTS voice gender for dubbing (default: male)",
+    )
     args = ap.parse_args()
 
     result = process_video(
@@ -1026,6 +1030,7 @@ def main():
         dry_run=args.dry_run,
         convert_portrait=not args.no_convert,
         dub_audio=args.dub,
+        voice_gender=args.voice,
     )
 
     if result["status"] == "error":
