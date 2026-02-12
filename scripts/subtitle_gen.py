@@ -471,19 +471,21 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
         # by the next segment's start, preventing overlapping speech.
         segments = sorted(segments, key=lambda s: s["start"])
 
+        # --- Pass 1: generate all TTS clips and measure durations ---
+        seg_info = []  # [(mp3_path, tts_samples, max_samples), ...]
         for i, seg in enumerate(segments):
             text = seg["text"].strip()
             if not text:
+                seg_info.append(None)
                 continue
 
             mp3_path = os.path.join(tmpdir, f"seg_{i:04d}.mp3")
             mp3_paths.append(mp3_path)
 
-            # Generate MP3 via edge-tts
             comm = edge_tts.Communicate(text, voice)
             asyncio.run(comm.save(mp3_path))
 
-            # Decode MP3 to raw PCM float32 via ffmpeg
+            # Decode to get raw duration
             decode_cmd = [
                 ffmpeg_path, "-v", "error",
                 "-i", mp3_path,
@@ -494,19 +496,63 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
                 "pipe:1",
             ]
             proc = subprocess.run(decode_cmd, capture_output=True, check=True)
-            pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+            tts_samples = len(proc.stdout) // 4  # float32 = 4 bytes
 
-            # If TTS audio is longer than the gap to the next segment,
-            # re-decode with atempo to speed it up so it fits without
-            # cutting off any speech.
             next_start = (segments[i + 1]["start"]
                           if i + 1 < len(segments) else video_duration)
             max_samples = int((next_start - seg["start"]) * SAMPLE_RATE)
 
-            if len(pcm) > max_samples > 0:
-                speed = len(pcm) / max_samples
+            seg_info.append((mp3_path, tts_samples, max_samples))
+
+            if (i + 1) % 10 == 0 or i + 1 == len(segments):
+                log(f"  TTS: {i + 1}/{len(segments)} segments generated")
+
+        # --- Compute the minimum uniform speed that fits everything ---
+        # Each segment can delay its start if the previous one hasn't
+        # finished, so tight segments borrow slack from generous ones.
+        # Binary-search for the lowest speed where the last segment's
+        # audio ends before the video does — no trimming needed.
+        active = [(i, info) for i, info in enumerate(seg_info) if info]
+
+        def _fits(speed):
+            """Check if all segments fit at the given speed."""
+            cursor = 0.0
+            for idx, (_, tts_s, _) in active:
+                orig_start = segments[idx]["start"]
+                start = max(orig_start, cursor)
+                cursor = start + tts_s / (speed * SAMPLE_RATE)
+            return cursor <= video_duration
+
+        lo, hi = 1.0, 3.0
+        if _fits(lo):
+            uniform_speed = 1.0
+        else:
+            # Binary search (20 iterations gives ~1e-6 precision)
+            for _ in range(20):
+                mid = (lo + hi) / 2
+                if _fits(mid):
+                    hi = mid
+                else:
+                    lo = mid
+            uniform_speed = hi
+
+        if uniform_speed > 1.001:
+            log(f"  TTS uniform speed: {uniform_speed:.2f}x")
+
+        # --- Compute adjusted start times with the chosen speed ---
+        adjusted_starts = {}
+        cursor = 0.0
+        for idx, (_, tts_s, _) in active:
+            orig_start = segments[idx]["start"]
+            start = max(orig_start, cursor)
+            adjusted_starts[idx] = start
+            cursor = start + tts_s / (uniform_speed * SAMPLE_RATE)
+
+        # --- Pass 2: decode with uniform atempo and place in buffer ---
+        for idx, (mp3_path, tts_samples, max_samples) in active:
+            if uniform_speed > 1.001:
                 # Build atempo filter chain (each filter limited to 2.0x)
-                parts, s = [], speed
+                parts, s = [], uniform_speed
                 while s > 2.0:
                     parts.append("atempo=2.0")
                     s /= 2.0
@@ -526,16 +572,26 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
                 proc = subprocess.run(tempo_cmd, capture_output=True,
                                       check=True)
                 pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+            else:
+                decode_cmd = [
+                    ffmpeg_path, "-v", "error",
+                    "-i", mp3_path,
+                    "-f", "f32le",
+                    "-acodec", "pcm_f32le",
+                    "-ar", str(SAMPLE_RATE),
+                    "-ac", "1",
+                    "pipe:1",
+                ]
+                proc = subprocess.run(decode_cmd, capture_output=True,
+                                      check=True)
+                pcm = np.frombuffer(proc.stdout, dtype=np.float32)
 
-            # Place at the segment's start offset (additive mix)
-            offset = int(seg["start"] * SAMPLE_RATE)
+            # Place at the adjusted start offset (additive mix)
+            offset = int(adjusted_starts[idx] * SAMPLE_RATE)
             end = min(offset + len(pcm), total_samples)
             length = end - offset
             if length > 0:
                 mixed[offset:end] += pcm[:length]
-
-            if (i + 1) % 10 == 0 or i + 1 == len(segments):
-                log(f"  TTS: {i + 1}/{len(segments)} segments synthesized")
 
         # Clip to [-1, 1] and convert to int16
         np.clip(mixed, -1.0, 1.0, out=mixed)

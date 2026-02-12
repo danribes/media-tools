@@ -66,7 +66,8 @@ def _make_callback(shared):
 
 
 def _run_processing(shared, input_source, target_lang, model_size, dry_run,
-                    convert_portrait=True, dub_audio=False, voice_gender="male"):
+                    convert_portrait=True, dub_audio=False, voice_gender="male",
+                    burn_subs=True):
     """Run process_video in a thread, storing result/error in shared dict."""
     try:
         result = process_video(
@@ -79,6 +80,7 @@ def _run_processing(shared, input_source, target_lang, model_size, dry_run,
             convert_portrait=convert_portrait,
             dub_audio=dub_audio,
             voice_gender=voice_gender,
+            burn_subs=burn_subs,
         )
         shared["result"] = result
     except UnsupportedLanguageError as e:
@@ -99,34 +101,34 @@ def main():
     # --- Sidebar settings ---
     with st.sidebar:
         st.header("Settings")
-        subtitle_mode = st.radio("Subtitles", [
+        target_lang_mode = st.radio("Target language", [
             "Spanish (es)",
             "English (en)",
-            "No subtitles",
         ], index=0)
-        target_lang = {"Spanish (es)": "es", "English (en)": "en", "No subtitles": None}[subtitle_mode]
+        target_lang = {"Spanish (es)": "es", "English (en)": "en"}[target_lang_mode]
+
+        output_mode = st.radio("Output mode", [
+            "Subtitles only",
+            "Audio dub only",
+            "Subtitles + Audio dub",
+            "No subtitles / No dub",
+        ])
+        dub_audio = output_mode in ("Audio dub only", "Subtitles + Audio dub")
+        burn_subs = output_mode in ("Subtitles only", "Subtitles + Audio dub")
+
+        if output_mode == "No subtitles / No dub":
+            target_lang = None
+
+        if dub_audio:
+            voice_gender = st.radio("Voice", ["Male", "Female"]).lower()
+        else:
+            voice_gender = "male"
 
         if target_lang is not None:
-            output_mode = st.radio("Output mode", [
-                "Subtitles (keep original audio)",
-                "Audio dub (replace with TTS audio)",
-            ])
-            dub_audio = output_mode == "Audio dub (replace with TTS audio)"
-
-            if dub_audio:
-                voice_gender = st.radio("Voice", [
-                    "Male", "Female",
-                ])
-                voice_gender = voice_gender.lower()
-            else:
-                voice_gender = "male"
-
             model_size = st.selectbox("Whisper model", [
                 "tiny", "base", "small", "medium", "large",
             ], index=2)
         else:
-            dub_audio = False
-            voice_gender = "male"
             model_size = "small"
 
         convert_portrait = st.checkbox("Convert portrait to 10:9", value=True)
@@ -176,7 +178,7 @@ def main():
             thread = threading.Thread(
                 target=_run_processing,
                 args=(shared, input_source, target_lang, model_size, dry_run,
-                      convert_portrait, dub_audio, voice_gender),
+                      convert_portrait, dub_audio, voice_gender, burn_subs),
                 daemon=True,
             )
             thread.start()
@@ -248,7 +250,7 @@ def main():
                 thread = threading.Thread(
                     target=_run_processing,
                     args=(shared, input_source, None, model_size, dry_run,
-                          convert_portrait, False),
+                          convert_portrait, False, "male", False),
                     daemon=True,
                 )
                 thread.start()

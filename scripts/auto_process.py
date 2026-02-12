@@ -113,6 +113,32 @@ def _check_existing_subs(video_path, base_dir):
     return srt_path, detected
 
 
+def _parse_srt(srt_path):
+    """Parse an SRT file into segment dicts [{start, end, text}, ...]."""
+    with open(srt_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    segments = []
+    for block in re.split(r'\n\n+', content.strip()):
+        lines = block.strip().splitlines()
+        if len(lines) < 3:
+            continue
+        match = re.match(
+            r'(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*'
+            r'(\d{2}):(\d{2}):(\d{2}),(\d{3})',
+            lines[1].strip(),
+        )
+        if not match:
+            continue
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(x) for x in match.groups())
+        start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
+        end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
+        text = "\n".join(lines[2:]).strip()
+        if text:
+            segments.append({"start": start, "end": end, "text": text})
+    return segments
+
+
 def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
     """
     Quick OCR sample: extract ~10 frames from the bottom subtitle region,
@@ -444,24 +470,25 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
         os.unlink(tmp_ass.name)
 
 
-def _ffmpeg_encode_with_dub(input_path, wav_path, ass_path, output_path,
+def _ffmpeg_encode_with_dub(input_path, wav_path, output_path,
+                            ass_path=None,
                             scale_w=None, scale_h=None, ffmpeg_path="ffmpeg"):
     """Encode video with dubbed audio WAV, optionally scaling + burning subtitles."""
-    tmp_ass = tempfile.NamedTemporaryFile(
-        suffix=".ass", delete=False, prefix="subs_",
-    )
-    tmp_ass.close()
-    with open(ass_path, "rb") as src, open(tmp_ass.name, "wb") as dst:
-        dst.write(src.read())
-
-    escaped = tmp_ass.name.replace("\\", "/").replace(":", "\\:")
-
-    # Build video filter chain
+    tmp_ass = None
     vf_parts = []
+
     if scale_w and scale_h:
         vf_parts.append(f"scale={scale_w}:{scale_h},setsar=1")
-    vf_parts.append(f"ass={escaped}")
-    vf_str = ",".join(vf_parts)
+
+    if ass_path:
+        tmp_ass = tempfile.NamedTemporaryFile(
+            suffix=".ass", delete=False, prefix="subs_",
+        )
+        tmp_ass.close()
+        with open(ass_path, "rb") as src, open(tmp_ass.name, "wb") as dst:
+            dst.write(src.read())
+        escaped = tmp_ass.name.replace("\\", "/").replace(":", "\\:")
+        vf_parts.append(f"ass={escaped}")
 
     cmd = [
         ffmpeg_path,
@@ -469,7 +496,10 @@ def _ffmpeg_encode_with_dub(input_path, wav_path, ass_path, output_path,
         "-i", wav_path,
         "-map", "0:v:0",
         "-map", "1:a",
-        "-vf", vf_str,
+    ]
+    if vf_parts:
+        cmd += ["-vf", ",".join(vf_parts)]
+    cmd += [
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
@@ -479,13 +509,15 @@ def _ffmpeg_encode_with_dub(input_path, wav_path, ass_path, output_path,
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     finally:
-        os.unlink(tmp_ass.name)
+        if tmp_ass:
+            os.unlink(tmp_ass.name)
 
 
 def execute_pipeline(video_path, actions, target_lang, audio_lang,
                      whisper_model, width, height, ffmpeg, ffprobe,
                      base_dir=None, on_progress=print_progress, tracker=None,
-                     duration=0, dub_audio=False, voice_gender="male"):
+                     duration=0, dub_audio=False, voice_gender="male",
+                     burn_subs=True, existing_segments=None):
     """
     Execute the decided actions using direct Python calls.
     Combines convert + burn into a single ffmpeg pass when both are needed.
@@ -513,10 +545,27 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
         target_w, target_h = width, height
 
     # --- Generate subtitles if needed ---
-    segments = None
+    segments = existing_segments  # may be pre-loaded from existing SRT
     position = margin = existing_region = None
 
-    if sub_action:
+    if segments:
+        # Segments already loaded (e.g. from existing SRT for dub-only).
+        # Skip transcription/translation steps.
+        if tracker:
+            if burn_subs:
+                tracker.begin("Analyzing subtitle placement")
+            else:
+                tracker.skip("Analyzing subtitle placement")
+            tracker.skip("Transcribing audio")
+            tracker.skip("Translating subtitles")
+        if burn_subs:
+            position, margin, existing_region, _, _ = find_subtitle_placement(
+                video_path, ffmpeg, ffprobe,
+                log=lambda m: _log(m),
+            )
+            if tracker:
+                tracker.finish("Analyzing subtitle placement")
+    elif sub_action:
         if tracker:
             tracker.begin("Analyzing subtitle placement")
         position, margin, existing_region, _, _ = find_subtitle_placement(
@@ -548,22 +597,31 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
         out_dir = os.path.join(base_dir, "subbed")
         os.makedirs(out_dir, exist_ok=True)
 
-        ass_path = os.path.join(out_dir, f"{basename}.ass")
         srt_path = os.path.join(out_dir, f"{basename}.srt")
+        ass_path = os.path.join(out_dir, f"{basename}.ass")
         output_path = os.path.join(out_dir, f"{basename}_subtitled.mp4")
 
         if tracker:
             tracker.begin("Generating subtitle files")
-        _log(f"  Writing subtitle files (position: {position})...")
-        save_srt(segments, srt_path)
-        _log(f"  SRT: {srt_path}")
-        generate_ass(segments, position, margin, target_w, target_h, ass_path)
-        _log(f"  ASS: {ass_path}")
+        if burn_subs:
+            _log(f"  Writing subtitle files (position: {position})...")
+            save_srt(segments, srt_path)
+            _log(f"  SRT: {srt_path}")
+            generate_ass(segments, position, margin, target_w, target_h, ass_path)
+            _log(f"  ASS: {ass_path}")
+            result_paths["output_srt"] = srt_path
+            result_paths["output_ass"] = ass_path
+        else:
+            # Save SRT for reference unless it already exists on disk
+            if not os.path.isfile(srt_path):
+                save_srt(segments, srt_path)
+                _log(f"  SRT (reference): {srt_path}")
+            else:
+                _log(f"  SRT (existing): {srt_path}")
+            result_paths["output_srt"] = srt_path
+            ass_path = None
         if tracker:
             tracker.finish("Generating subtitle files")
-
-        result_paths["output_srt"] = srt_path
-        result_paths["output_ass"] = ass_path
 
         # --- Synthesize dubbed audio if requested ---
         wav_path = None
@@ -589,19 +647,23 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
             scale_h = target_h if needs_convert else None
             _log("  Encoding video with dubbed audio...")
             _ffmpeg_encode_with_dub(
-                video_path, wav_path, ass_path, output_path,
+                video_path, wav_path, output_path,
+                ass_path=ass_path if burn_subs else None,
                 scale_w=scale_w, scale_h=scale_h, ffmpeg_path=ffmpeg,
             )
-        elif needs_convert:
+        elif burn_subs and needs_convert:
             _log(f"  Encoding: scale {width}x{height} -> "
                  f"{target_w}x{target_h} + burn subtitles...")
             _ffmpeg_convert_and_burn(
                 video_path, ass_path, output_path,
                 target_w, target_h, ffmpeg,
             )
-        else:
+        elif burn_subs:
             _log("  Burning subtitles into video...")
             burn_subtitles(video_path, ass_path, output_path, ffmpeg)
+        else:
+            # No subs, no dub — shouldn't reach here, but handle gracefully
+            _log("  No encoding needed for subtitle/dub step.")
         if tracker:
             tracker.finish("Encoding video")
 
@@ -768,7 +830,7 @@ def is_url(s):
 def process_video(input_source, target_lang="es", model_size="small",
                   dry_run=False, base_dir=None,
                   on_progress=print_progress, convert_portrait=True,
-                  dub_audio=False, voice_gender="male"):
+                  dub_audio=False, voice_gender="male", burn_subs=True):
     """
     Main entry point for the auto-process pipeline.
 
@@ -803,14 +865,21 @@ def process_video(input_source, target_lang="es", model_size="small",
 
     # --- Check for existing subtitles before expensive work ---
     existing_srt_lang = None
+    existing_segments = None
     if target_lang is not None and not is_url(input_source):
         video_path_resolved = os.path.abspath(input_source)
         srt_path, detected_lang = _check_existing_subs(video_path_resolved, base_dir)
         if detected_lang == target_lang:
             existing_srt_lang = detected_lang
-            on_progress(ProgressUpdate("assessment",
-                f"  Existing subtitles found: {srt_path} (detected: {detected_lang})"
-                f" — skipping subtitle generation", -1))
+            if dub_audio:
+                existing_segments = _parse_srt(srt_path)
+                on_progress(ProgressUpdate("assessment",
+                    f"  Existing subtitles found: {srt_path} (detected: {detected_lang})"
+                    f" — reusing for dubbing", -1))
+            else:
+                on_progress(ProgressUpdate("assessment",
+                    f"  Existing subtitles found: {srt_path} (detected: {detected_lang})"
+                    f" — skipping subtitle generation", -1))
 
     # --- Build step tracker ---
     skip_whisper = target_lang is None or existing_srt_lang is not None
@@ -946,7 +1015,7 @@ def process_video(input_source, target_lang="es", model_size="small",
     needs_subs = sub_action is not None
     needs_translate = sub_action and sub_action["type"] == "whisper_translate"
 
-    if not needs_subs:
+    if not needs_subs and not existing_segments:
         tracker.skip("Analyzing subtitle placement")
         tracker.skip("Transcribing audio")
         tracker.skip("Translating subtitles")
@@ -954,6 +1023,15 @@ def process_video(input_source, target_lang="es", model_size="small",
         tracker.skip("Synthesizing audio")
         if not needs_convert:
             tracker.skip("Encoding video")
+    elif existing_segments:
+        # Segments pre-loaded from existing SRT — skip transcription steps
+        # but keep synthesis + encode active.
+        if not burn_subs:
+            tracker.skip("Analyzing subtitle placement")
+        tracker.skip("Transcribing audio")
+        tracker.skip("Translating subtitles")
+        if not dub_audio:
+            tracker.skip("Synthesizing audio")
     else:
         if not needs_translate:
             tracker.skip("Translating subtitles")
@@ -973,6 +1051,7 @@ def process_video(input_source, target_lang="es", model_size="small",
         whisper_model, width, height, ffmpeg, ffprobe,
         base_dir=base_dir, on_progress=on_progress, tracker=tracker,
         duration=duration, dub_audio=dub_audio, voice_gender=voice_gender,
+        burn_subs=burn_subs, existing_segments=existing_segments,
     )
 
     result.update(paths)
@@ -1011,7 +1090,7 @@ def main():
     )
     ap.add_argument(
         "--no-subs", action="store_true",
-        help="Skip subtitles entirely (no Whisper/OCR)",
+        help="Skip burning subtitles into video (still generates SRT for reference)",
     )
     ap.add_argument(
         "--dub", action="store_true",
@@ -1023,14 +1102,21 @@ def main():
     )
     args = ap.parse_args()
 
+    # --no-subs without --dub means skip everything; with --dub means dub-only
+    if args.no_subs and not args.dub:
+        target_lang = None
+    else:
+        target_lang = args.target_lang
+
     result = process_video(
         args.input,
-        target_lang=None if args.no_subs else args.target_lang,
+        target_lang=target_lang,
         model_size=args.model,
         dry_run=args.dry_run,
         convert_portrait=not args.no_convert,
         dub_audio=args.dub,
         voice_gender=args.voice,
+        burn_subs=not args.no_subs,
     )
 
     if result["status"] == "error":
