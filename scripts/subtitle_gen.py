@@ -467,6 +467,10 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
     mp3_paths = []
 
     try:
+        # Sort by start time so each segment's audio window is bounded
+        # by the next segment's start, preventing overlapping speech.
+        segments = sorted(segments, key=lambda s: s["start"])
+
         for i, seg in enumerate(segments):
             text = seg["text"].strip()
             if not text:
@@ -480,7 +484,7 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
             asyncio.run(comm.save(mp3_path))
 
             # Decode MP3 to raw PCM float32 via ffmpeg
-            cmd = [
+            decode_cmd = [
                 ffmpeg_path, "-v", "error",
                 "-i", mp3_path,
                 "-f", "f32le",
@@ -489,8 +493,39 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
                 "-ac", "1",
                 "pipe:1",
             ]
-            proc = subprocess.run(cmd, capture_output=True, check=True)
+            proc = subprocess.run(decode_cmd, capture_output=True, check=True)
             pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+
+            # If TTS audio is longer than the gap to the next segment,
+            # re-decode with atempo to speed it up so it fits without
+            # cutting off any speech.
+            next_start = (segments[i + 1]["start"]
+                          if i + 1 < len(segments) else video_duration)
+            max_samples = int((next_start - seg["start"]) * SAMPLE_RATE)
+
+            if len(pcm) > max_samples > 0:
+                speed = len(pcm) / max_samples
+                # Build atempo filter chain (each filter limited to 2.0x)
+                parts, s = [], speed
+                while s > 2.0:
+                    parts.append("atempo=2.0")
+                    s /= 2.0
+                parts.append(f"atempo={s:.4f}")
+                af = ",".join(parts)
+
+                tempo_cmd = [
+                    ffmpeg_path, "-v", "error",
+                    "-i", mp3_path,
+                    "-af", af,
+                    "-f", "f32le",
+                    "-acodec", "pcm_f32le",
+                    "-ar", str(SAMPLE_RATE),
+                    "-ac", "1",
+                    "pipe:1",
+                ]
+                proc = subprocess.run(tempo_cmd, capture_output=True,
+                                      check=True)
+                pcm = np.frombuffer(proc.stdout, dtype=np.float32)
 
             # Place at the segment's start offset (additive mix)
             offset = int(seg["start"] * SAMPLE_RATE)
