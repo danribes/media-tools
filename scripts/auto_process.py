@@ -704,7 +704,8 @@ def _latest_mp4(directory):
 # URL handling
 # ---------------------------------------------------------------------------
 
-def download_url(url, base_dir=None, on_progress=print_progress, cookies_browser=None):
+def download_url(url, base_dir=None, on_progress=print_progress, cookies_browser=None,
+                 cookies_file=None):
     """Download a URL using yt-dlp directly, return the downloaded file path."""
     if base_dir is None:
         base_dir = BASE_DIR
@@ -735,7 +736,9 @@ def download_url(url, base_dir=None, on_progress=print_progress, cookies_browser
     ]
     if ffmpeg_dir:
         cmd += ["--ffmpeg-location", ffmpeg_dir]
-    if cookies_browser:
+    if cookies_file:
+        cmd += ["--cookies", cookies_file]
+    elif cookies_browser:
         cmd += ["--cookies-from-browser", cookies_browser]
     cmd.append(url)
 
@@ -833,7 +836,7 @@ def process_video(input_source, target_lang="es", model_size="small",
                   dry_run=False, base_dir=None,
                   on_progress=print_progress, convert_portrait=True,
                   dub_audio=False, voice_gender="male", burn_subs=True,
-                  cookies_browser=None):
+                  cookies_browser=None, cookies_file=None):
     """
     Main entry point for the auto-process pipeline.
 
@@ -915,7 +918,8 @@ def process_video(input_source, target_lang="es", model_size="small",
         tracker.begin("Downloading video")
         video_path = download_url(input_source, base_dir=base_dir,
                                   on_progress=on_progress,
-                                  cookies_browser=cookies_browser)
+                                  cookies_browser=cookies_browser,
+                                  cookies_file=cookies_file)
         tracker.finish("Downloading video")
     else:
         video_path = os.path.abspath(input_source)

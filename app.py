@@ -6,6 +6,7 @@ Run: streamlit run app.py
 """
 
 import os
+import re
 import sys
 import threading
 import time
@@ -71,6 +72,7 @@ TRANSLATIONS = {
         "no_output": "No output video \u2014 the video may have needed no processing.",
         "browser_cookies": "Browser cookies",
         "browser_none": "None",
+        "cookies_file": "Cookies file (.txt)",
     },
     "es": {
         "caption": "Procesar videos: descargar, convertir, subtitular, traducir",
@@ -121,6 +123,7 @@ TRANSLATIONS = {
         "no_output": "Sin video de salida \u2014 el video puede no haber necesitado procesamiento.",
         "browser_cookies": "Cookies del navegador",
         "browser_none": "Ninguno",
+        "cookies_file": "Archivo de cookies (.txt)",
     },
 }
 
@@ -170,7 +173,7 @@ def _make_callback(shared):
 
 def _run_processing(shared, input_source, target_lang, model_size, dry_run,
                     convert_portrait=True, dub_audio=False, voice_gender="male",
-                    burn_subs=True, cookies_browser=None):
+                    burn_subs=True, cookies_browser=None, cookies_file=None):
     """Run process_video in a thread, storing result/error in shared dict."""
     try:
         result = process_video(
@@ -182,6 +185,7 @@ def _run_processing(shared, input_source, target_lang, model_size, dry_run,
             on_progress=_make_callback(shared),
             convert_portrait=convert_portrait,
             cookies_browser=cookies_browser,
+            cookies_file=cookies_file,
             dub_audio=dub_audio,
             voice_gender=voice_gender,
             burn_subs=burn_subs,
@@ -253,6 +257,14 @@ def main():
         if cookies_browser == t["browser_none"]:
             cookies_browser = None
 
+        cookies_file = None
+        uploaded_cookies = st.file_uploader(t["cookies_file"], type=["txt"])
+        if uploaded_cookies is not None:
+            cookies_path = os.path.join(BASE_DIR, "cookies.txt")
+            with open(cookies_path, "wb") as f:
+                f.write(uploaded_cookies.getbuffer())
+            cookies_file = cookies_path
+
     # --- Input tabs ---
     tab_url, tab_upload = st.tabs([t["tab_url"], t["tab_upload"]])
 
@@ -261,10 +273,13 @@ def main():
     with tab_url:
         url = st.text_input(t["paste_url"],
                             placeholder="https://x.com/user/status/123456...")
-        if url and is_url(url.strip()):
-            input_source = url.strip()
-        elif url:
-            st.warning(t["invalid_url"])
+        if url:
+            # Strip whitespace and trailing non-URL junk (e.g. " ---")
+            cleaned = re.sub(r'[\s\-]+$', '', url.strip())
+            if is_url(cleaned):
+                input_source = cleaned
+            else:
+                st.warning(t["invalid_url"])
 
     with tab_upload:
         uploaded = st.file_uploader(t["upload_video"], type=["mp4", "mov", "mkv", "webm"])
@@ -297,7 +312,7 @@ def main():
                 target=_run_processing,
                 args=(shared, input_source, target_lang, model_size, dry_run,
                       convert_portrait, dub_audio, voice_gender, burn_subs,
-                      cookies_browser),
+                      cookies_browser, cookies_file),
                 daemon=True,
             )
             thread.start()
