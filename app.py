@@ -69,6 +69,8 @@ TRANSLATIONS = {
         "download_srt": "Download SRT",
         "download_ass": "Download ASS",
         "no_output": "No output video \u2014 the video may have needed no processing.",
+        "browser_cookies": "Browser cookies",
+        "browser_none": "None",
     },
     "es": {
         "caption": "Procesar videos: descargar, convertir, subtitular, traducir",
@@ -117,6 +119,8 @@ TRANSLATIONS = {
         "download_srt": "Descargar SRT",
         "download_ass": "Descargar ASS",
         "no_output": "Sin video de salida \u2014 el video puede no haber necesitado procesamiento.",
+        "browser_cookies": "Cookies del navegador",
+        "browser_none": "Ninguno",
     },
 }
 
@@ -166,7 +170,7 @@ def _make_callback(shared):
 
 def _run_processing(shared, input_source, target_lang, model_size, dry_run,
                     convert_portrait=True, dub_audio=False, voice_gender="male",
-                    burn_subs=True):
+                    burn_subs=True, cookies_browser=None):
     """Run process_video in a thread, storing result/error in shared dict."""
     try:
         result = process_video(
@@ -177,6 +181,7 @@ def _run_processing(shared, input_source, target_lang, model_size, dry_run,
             base_dir=BASE_DIR,
             on_progress=_make_callback(shared),
             convert_portrait=convert_portrait,
+            cookies_browser=cookies_browser,
             dub_audio=dub_audio,
             voice_gender=voice_gender,
             burn_subs=burn_subs,
@@ -243,6 +248,11 @@ def main():
 
         dry_run = st.checkbox(t["dry_run"], value=False)
 
+        browser_options = [t["browser_none"], "chrome", "firefox", "edge", "brave", "chromium"]
+        cookies_browser = st.selectbox(t["browser_cookies"], browser_options, index=0)
+        if cookies_browser == t["browser_none"]:
+            cookies_browser = None
+
     # --- Input tabs ---
     tab_url, tab_upload = st.tabs([t["tab_url"], t["tab_upload"]])
 
@@ -286,7 +296,8 @@ def main():
             thread = threading.Thread(
                 target=_run_processing,
                 args=(shared, input_source, target_lang, model_size, dry_run,
-                      convert_portrait, dub_audio, voice_gender, burn_subs),
+                      convert_portrait, dub_audio, voice_gender, burn_subs,
+                      cookies_browser),
                 daemon=True,
             )
             thread.start()

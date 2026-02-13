@@ -2,5 +2,8 @@
 maxUploadSize = 500
 headless = true
 
+[client]
+toolbarMode = "minimal"
+
 [theme]
 base = "dark"
