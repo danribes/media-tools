@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # Allow importing from the same scripts/ directory
@@ -43,6 +44,7 @@ from subtitle_gen import (
     detect_language_quick,
     find_subtitle_placement,
     generate_ass,
+    get_tesseract_lang,
     get_video_info,
     load_whisper_model,
     ocr_frame,
@@ -55,6 +57,17 @@ from subtitle_gen import (
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SCRIPT_DIR)  # media-tools/
+
+
+class CancelledError(Exception):
+    """Raised when the user cancels processing."""
+    pass
+
+
+def _check_cancel(cancel_event):
+    """Raise CancelledError if the cancel event is set."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError("Processing cancelled by user")
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +366,8 @@ def compute_10_9_dimensions(src_w, src_h):
 
 def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
                            whisper_model, existing_region, ffmpeg, ffprobe,
-                           on_progress=print_progress, tracker=None):
+                           on_progress=print_progress, tracker=None,
+                           cancel_event=None):
     """
     Produce subtitle segments based on the decided strategy.
     Reuses the already-loaded whisper_model. Falls back to Whisper if OCR
@@ -363,6 +377,7 @@ def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
         on_progress(ProgressUpdate("execution", msg, -1))
 
     if sub_action_type == "transcribe_only":
+        _check_cancel(cancel_event)
         if tracker:
             tracker.begin("Transcribing audio")
         _log("  Transcribing audio (same language, no translation)...")
@@ -375,12 +390,14 @@ def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
         return segments
 
     elif sub_action_type == "ocr_sync_translate":
+        _check_cancel(cancel_event)
         if tracker:
             tracker.begin("Transcribing audio")
+        ocr_lang = get_tesseract_lang(audio_lang) if audio_lang else "eng"
         _log(f"  Running full OCR scan on '{existing_region}' region...")
         raw_ocr = detect_burned_in_subs(
             video_path, existing_region, ffmpeg, ffprobe,
-            log=lambda m: _log(m),
+            log=lambda m: _log(m), ocr_lang=ocr_lang,
         )
         is_usable, confidence, good_segments = assess_ocr_quality(raw_ocr)
         _log(f"  OCR quality: {len(good_segments)}/{len(raw_ocr)} "
@@ -418,6 +435,7 @@ def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
             return segments
 
     elif sub_action_type == "whisper_translate":
+        _check_cancel(cancel_event)
         if tracker:
             tracker.begin("Transcribing audio")
         _log("  Transcribing audio with Whisper...")
@@ -428,6 +446,7 @@ def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
         if tracker:
             tracker.finish("Transcribing audio")
         if detected != target_lang and segments:
+            _check_cancel(cancel_event)
             if tracker:
                 tracker.begin("Translating subtitles")
             _log(f"  Translating: {detected} -> {target_lang}...")
@@ -444,7 +463,7 @@ def _get_subtitle_segments(sub_action_type, video_path, target_lang, audio_lang,
 
 
 def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
-                             width, height, ffmpeg_path):
+                             width, height, ffmpeg_path, output_codec="h264"):
     """Single ffmpeg pass: scale to 10:9 + burn ASS subtitles."""
     tmp_ass = tempfile.NamedTemporaryFile(
         suffix=".ass", delete=False, prefix="subs_",
@@ -455,14 +474,14 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
 
     escaped = tmp_ass.name.replace("\\", "/").replace(":", "\\:")
 
+    # Video filters present → re-encoding required regardless of codec choice
     cmd = [
         ffmpeg_path, "-i", input_path,
         "-vf", f"scale={width}:{height},setsar=1,ass={escaped}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-y", output_path,
     ]
+    cmd += _video_codec_args(output_codec, has_video_filters=True)
+    cmd += _audio_codec_args(output_codec, has_new_audio=False)
+    cmd += ["-movflags", "+faststart", "-y", output_path]
 
     try:
         subprocess.run(cmd, check=True, capture_output=True)
@@ -472,7 +491,8 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
 
 def _ffmpeg_encode_with_dub(input_path, wav_path, output_path,
                             ass_path=None,
-                            scale_w=None, scale_h=None, ffmpeg_path="ffmpeg"):
+                            scale_w=None, scale_h=None, ffmpeg_path="ffmpeg",
+                            output_codec="h264"):
     """Encode video with dubbed audio WAV, optionally scaling + burning subtitles."""
     tmp_ass = None
     vf_parts = []
@@ -490,6 +510,8 @@ def _ffmpeg_encode_with_dub(input_path, wav_path, output_path,
         escaped = tmp_ass.name.replace("\\", "/").replace(":", "\\:")
         vf_parts.append(f"ass={escaped}")
 
+    has_vf = bool(vf_parts)
+
     cmd = [
         ffmpeg_path,
         "-i", input_path,
@@ -497,14 +519,12 @@ def _ffmpeg_encode_with_dub(input_path, wav_path, output_path,
         "-map", "0:v:0",
         "-map", "1:a",
     ]
-    if vf_parts:
+    if has_vf:
         cmd += ["-vf", ",".join(vf_parts)]
-    cmd += [
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-y", output_path,
-    ]
+    cmd += _video_codec_args(output_codec, has_video_filters=has_vf)
+    # New audio track from dub → always encode audio
+    cmd += ["-c:a", "aac", "-b:a", "128k"]
+    cmd += ["-movflags", "+faststart", "-y", output_path]
 
     try:
         subprocess.run(cmd, check=True, capture_output=True)
@@ -513,11 +533,35 @@ def _ffmpeg_encode_with_dub(input_path, wav_path, output_path,
             os.unlink(tmp_ass.name)
 
 
+def _video_codec_args(output_codec, has_video_filters):
+    """Return ffmpeg video codec arguments.
+
+    When output_codec is "copy" and no video filters are applied, the video
+    stream is copied without re-encoding.  If video filters are present,
+    re-encoding is mandatory so we fall back to H.264.
+    """
+    if output_codec == "copy" and not has_video_filters:
+        return ["-c:v", "copy"]
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+
+
+def _audio_codec_args(output_codec, has_new_audio):
+    """Return ffmpeg audio codec arguments.
+
+    When output_codec is "copy" and no new audio track is being mixed in,
+    the audio stream is also copied.  Otherwise it is re-encoded as AAC.
+    """
+    if output_codec == "copy" and not has_new_audio:
+        return ["-c:a", "copy"]
+    return ["-c:a", "aac", "-b:a", "128k"]
+
+
 def execute_pipeline(video_path, actions, target_lang, audio_lang,
                      whisper_model, width, height, ffmpeg, ffprobe,
                      base_dir=None, on_progress=print_progress, tracker=None,
                      duration=0, dub_audio=False, voice_gender="male",
-                     burn_subs=True, existing_segments=None):
+                     burn_subs=True, existing_segments=None,
+                     cancel_event=None, output_codec="h264"):
     """
     Execute the decided actions using direct Python calls.
     Combines convert + burn into a single ffmpeg pass when both are needed.
@@ -566,6 +610,7 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
             if tracker:
                 tracker.finish("Analyzing subtitle placement")
     elif sub_action:
+        _check_cancel(cancel_event)
         if tracker:
             tracker.begin("Analyzing subtitle placement")
         position, margin, existing_region, _, _ = find_subtitle_placement(
@@ -579,6 +624,7 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
             sub_action["type"], video_path, target_lang, audio_lang,
             whisper_model, existing_region, ffmpeg, ffprobe,
             on_progress=on_progress, tracker=tracker,
+            cancel_event=cancel_event,
         )
 
         if not segments:
@@ -607,7 +653,8 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
             _log(f"  Writing subtitle files (position: {position})...")
             save_srt(segments, srt_path)
             _log(f"  SRT: {srt_path}")
-            generate_ass(segments, position, margin, target_w, target_h, ass_path)
+            generate_ass(segments, position, margin, target_w, target_h, ass_path,
+                        target_lang=target_lang)
             _log(f"  ASS: {ass_path}")
             result_paths["output_srt"] = srt_path
             result_paths["output_ass"] = ass_path
@@ -626,6 +673,7 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
         # --- Synthesize dubbed audio if requested ---
         wav_path = None
         if dub_audio:
+            _check_cancel(cancel_event)
             if tracker:
                 tracker.begin("Synthesizing audio")
             _log("  Synthesizing TTS audio...")
@@ -640,6 +688,7 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
             if tracker:
                 tracker.skip("Synthesizing audio")
 
+        _check_cancel(cancel_event)
         if tracker:
             tracker.begin("Encoding video")
         if dub_audio and wav_path:
@@ -650,17 +699,19 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
                 video_path, wav_path, output_path,
                 ass_path=ass_path if burn_subs else None,
                 scale_w=scale_w, scale_h=scale_h, ffmpeg_path=ffmpeg,
+                output_codec=output_codec,
             )
         elif burn_subs and needs_convert:
             _log(f"  Encoding: scale {width}x{height} -> "
                  f"{target_w}x{target_h} + burn subtitles...")
             _ffmpeg_convert_and_burn(
                 video_path, ass_path, output_path,
-                target_w, target_h, ffmpeg,
+                target_w, target_h, ffmpeg, output_codec=output_codec,
             )
         elif burn_subs:
             _log("  Burning subtitles into video...")
-            burn_subtitles(video_path, ass_path, output_path, ffmpeg)
+            burn_subtitles(video_path, ass_path, output_path, ffmpeg,
+                           output_codec=output_codec)
         else:
             # No subs, no dub — shouldn't reach here, but handle gracefully
             _log("  No encoding needed for subtitle/dub step.")
@@ -671,20 +722,27 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
         return output_path, result_paths
 
     elif needs_convert:
+        _check_cancel(cancel_event)
         if tracker:
             tracker.begin("Encoding video")
-        _log("  Converting to 10:9...")
-        convert_script = os.path.join(base_dir, "convert109.sh")
-        subprocess.run([convert_script, video_path], check=True,
-                       capture_output=True)
-        subbed_dir = os.path.join(base_dir, "subbed")
-        latest = _latest_mp4(subbed_dir)
+        target_w, target_h = compute_10_9_dimensions(width, height)
+        out_dir = os.path.join(base_dir, "subbed")
+        os.makedirs(out_dir, exist_ok=True)
+        output_path = os.path.join(out_dir, f"{basename}_10x9.mp4")
+        _log(f"  Converting to 10:9: {width}x{height} -> {target_w}x{target_h}...")
+        # Scaling requires re-encoding regardless of codec choice
+        cmd = [
+            ffmpeg, "-i", video_path,
+            "-vf", f"scale={target_w}:{target_h},setsar=1",
+        ]
+        cmd += _video_codec_args(output_codec, has_video_filters=True)
+        cmd += _audio_codec_args(output_codec, has_new_audio=False)
+        cmd += ["-movflags", "+faststart", "-y", output_path]
+        subprocess.run(cmd, check=True, capture_output=True)
         if tracker:
             tracker.finish("Encoding video")
-        if latest:
-            result_paths["output_video"] = latest
-            return latest, result_paths
-        raise RuntimeError("No converted file found after 10:9 conversion")
+        result_paths["output_video"] = output_path
+        return output_path, result_paths
 
     else:
         _log("  Nothing to do — video is already processed.")
@@ -836,7 +894,8 @@ def process_video(input_source, target_lang="es", model_size="small",
                   dry_run=False, base_dir=None,
                   on_progress=print_progress, convert_portrait=True,
                   dub_audio=False, voice_gender="male", burn_subs=True,
-                  cookies_browser=None, cookies_file=None):
+                  cookies_browser=None, cookies_file=None,
+                  cancel_event=None, output_codec="h264"):
     """
     Main entry point for the auto-process pipeline.
 
@@ -929,6 +988,7 @@ def process_video(input_source, target_lang="es", model_size="small",
             return result
 
     # === Phase 1: Assessment ===
+    _check_cancel(cancel_event)
     tracker.begin("Analyzing video")
     on_progress(ProgressUpdate("assessment", f"  File: {video_path}", -1))
 
@@ -964,11 +1024,13 @@ def process_video(input_source, target_lang="es", model_size="small",
             "subtitle_streams": len(subtitle_streams),
         }
     else:
+        _check_cancel(cancel_event)
         tracker.begin("Loading Whisper model")
         whisper_model = load_whisper_model(model_size,
             log=lambda m: on_progress(ProgressUpdate("assessment", m, -1)))
         tracker.finish("Loading Whisper model")
 
+        _check_cancel(cancel_event)
         # Parallel: language detection + OCR sampling
         tracker.begin("Detecting language & scanning subtitles")
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1054,12 +1116,14 @@ def process_video(input_source, target_lang="es", model_size="small",
         return result
 
     # === Phase 3: Execution ===
+    _check_cancel(cancel_event)
     final_file, paths = execute_pipeline(
         video_path, actions, target_lang, audio_lang,
         whisper_model, width, height, ffmpeg, ffprobe,
         base_dir=base_dir, on_progress=on_progress, tracker=tracker,
         duration=duration, dub_audio=dub_audio, voice_gender=voice_gender,
         burn_subs=burn_subs, existing_segments=existing_segments,
+        cancel_event=cancel_event, output_codec=output_codec,
     )
 
     result.update(paths)
@@ -1108,6 +1172,10 @@ def main():
         "--voice", choices=["male", "female"], default="male",
         help="TTS voice gender for dubbing (default: male)",
     )
+    ap.add_argument(
+        "--codec", choices=["h264", "copy"], default="h264",
+        help="Output video codec: h264 (re-encode) or copy (original, when possible)",
+    )
     args = ap.parse_args()
 
     # --no-subs without --dub means skip everything; with --dub means dub-only
@@ -1125,6 +1193,7 @@ def main():
         dub_audio=args.dub,
         voice_gender=args.voice,
         burn_subs=not args.no_subs,
+        output_codec=args.codec,
     )
 
     if result["status"] == "error":

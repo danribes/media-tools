@@ -17,10 +17,14 @@ import streamlit as st
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 
 from progress import ProgressUpdate, format_time
-from auto_process import process_video, is_url
+from auto_process import process_video, is_url, CancelledError
 from subtitle_gen import UnsupportedLanguageError
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Module-level lock to prevent multiple simultaneous processing sessions.
+# Protects against concurrent users corrupting shared output files.
+_processing_lock = threading.Lock()
 
 TRANSLATIONS = {
     "en": {
@@ -29,6 +33,16 @@ TRANSLATIONS = {
         "target_language": "Target language",
         "lang_spanish": "Spanish (es)",
         "lang_english": "English (en)",
+        "lang_french": "French (fr)",
+        "lang_german": "German (de)",
+        "lang_portuguese": "Portuguese (pt)",
+        "lang_italian": "Italian (it)",
+        "lang_japanese": "Japanese (ja)",
+        "lang_korean": "Korean (ko)",
+        "lang_chinese": "Chinese (zh)",
+        "lang_russian": "Russian (ru)",
+        "lang_arabic": "Arabic (ar)",
+        "lang_hindi": "Hindi (hi)",
         "output_mode": "Output mode",
         "output_subs_only": "Subtitles only",
         "output_dub_only": "Audio dub only",
@@ -73,6 +87,12 @@ TRANSLATIONS = {
         "browser_cookies": "Browser cookies",
         "browser_none": "None",
         "cookies_file": "Cookies file (.txt)",
+        "output_codec": "Output codec",
+        "codec_h264": "H.264",
+        "codec_copy": "Original (copy)",
+        "cancel": "Cancel",
+        "cancelled": "Processing was cancelled.",
+        "already_processing": "Another video is already being processed. Please wait for it to finish.",
     },
     "es": {
         "caption": "Procesar videos: descargar, convertir, subtitular, traducir",
@@ -80,6 +100,16 @@ TRANSLATIONS = {
         "target_language": "Idioma destino",
         "lang_spanish": "Espa\u00f1ol (es)",
         "lang_english": "Ingl\u00e9s (en)",
+        "lang_french": "Franc\u00e9s (fr)",
+        "lang_german": "Alem\u00e1n (de)",
+        "lang_portuguese": "Portugu\u00e9s (pt)",
+        "lang_italian": "Italiano (it)",
+        "lang_japanese": "Japon\u00e9s (ja)",
+        "lang_korean": "Coreano (ko)",
+        "lang_chinese": "Chino (zh)",
+        "lang_russian": "Ruso (ru)",
+        "lang_arabic": "\u00c1rabe (ar)",
+        "lang_hindi": "Hindi (hi)",
         "output_mode": "Modo de salida",
         "output_subs_only": "Solo subt\u00edtulos",
         "output_dub_only": "Solo doblaje",
@@ -124,6 +154,12 @@ TRANSLATIONS = {
         "browser_cookies": "Cookies del navegador",
         "browser_none": "Ninguno",
         "cookies_file": "Archivo de cookies (.txt)",
+        "output_codec": "Codec de salida",
+        "codec_h264": "H.264",
+        "codec_copy": "Original (copiar)",
+        "cancel": "Cancelar",
+        "cancelled": "El procesamiento fue cancelado.",
+        "already_processing": "Otro video ya se est\u00e1 procesando. Espere a que termine.",
     },
 }
 
@@ -134,6 +170,7 @@ def init_session_state():
         "processing": False,
         "result": None,
         "error": None,
+        "cancelled": False,
         "unsupported_lang": None,  # set when translator doesn't support detected lang
         "progress_log": [],
         # Plain dict shared with background thread.  st.session_state is
@@ -154,6 +191,8 @@ def _make_shared():
         "result": None,
         "error": None,
         "unsupported_lang": None,
+        "cancelled": False,
+        "cancel_event": threading.Event(),
         "start_time": time.time(),
     }
 
@@ -173,7 +212,8 @@ def _make_callback(shared):
 
 def _run_processing(shared, input_source, target_lang, model_size, dry_run,
                     convert_portrait=True, dub_audio=False, voice_gender="male",
-                    burn_subs=True, cookies_browser=None, cookies_file=None):
+                    burn_subs=True, cookies_browser=None, cookies_file=None,
+                    output_codec="h264"):
     """Run process_video in a thread, storing result/error in shared dict."""
     try:
         result = process_video(
@@ -189,14 +229,19 @@ def _run_processing(shared, input_source, target_lang, model_size, dry_run,
             dub_audio=dub_audio,
             voice_gender=voice_gender,
             burn_subs=burn_subs,
+            cancel_event=shared["cancel_event"],
+            output_codec=output_codec,
         )
         shared["result"] = result
+    except CancelledError:
+        shared["cancelled"] = True
     except UnsupportedLanguageError as e:
         shared["unsupported_lang"] = e.lang
     except Exception as e:
         shared["error"] = str(e)
     finally:
         shared["processing"] = False
+        _processing_lock.release()
 
 
 def main():
@@ -204,9 +249,9 @@ def main():
     init_session_state()
 
     # --- Language selector (before any translated content) ---
-    ui_lang = st.sidebar.radio("Language / Idioma", ["English", "Espa\u00f1ol"],
+    ui_lang = st.sidebar.radio("Language / Idioma", ["Espa\u00f1ol", "English"],
                                index=0, horizontal=True)
-    lang = "en" if ui_lang == "English" else "es"
+    lang = "es" if ui_lang == "Espa\u00f1ol" else "en"
     t = TRANSLATIONS[lang]
 
     st.title("Media Tools")
@@ -216,9 +261,18 @@ def main():
     with st.sidebar:
         st.header(t["settings"])
 
-        target_lang_options = [t["lang_spanish"], t["lang_english"]]
-        target_lang_mode = st.radio(t["target_language"], target_lang_options, index=0)
-        target_lang = ["es", "en"][target_lang_options.index(target_lang_mode)]
+        _lang_keys = [
+            ("es", "lang_spanish"), ("en", "lang_english"),
+            ("fr", "lang_french"), ("de", "lang_german"),
+            ("pt", "lang_portuguese"), ("it", "lang_italian"),
+            ("ja", "lang_japanese"), ("ko", "lang_korean"),
+            ("zh", "lang_chinese"), ("ru", "lang_russian"),
+            ("ar", "lang_arabic"), ("hi", "lang_hindi"),
+        ]
+        _lang_codes = [code for code, _ in _lang_keys]
+        target_lang_options = [t[key] for _, key in _lang_keys]
+        target_lang_mode = st.selectbox(t["target_language"], target_lang_options, index=0)
+        target_lang = _lang_codes[target_lang_options.index(target_lang_mode)]
 
         output_mode_options = [
             t["output_subs_only"],
@@ -249,6 +303,10 @@ def main():
             model_size = "small"
 
         convert_portrait = st.checkbox(t["convert_portrait"], value=True)
+
+        codec_options = [t["codec_copy"], t["codec_h264"]]
+        codec_selection = st.radio(t["output_codec"], codec_options, index=0)
+        output_codec = "copy" if codec_options.index(codec_selection) == 0 else "h264"
 
         dry_run = st.checkbox(t["dry_run"], value=False)
 
@@ -297,10 +355,13 @@ def main():
     if st.button(t["process"], type="primary", disabled=st.session_state.processing):
         if input_source is None:
             st.error(t["provide_input"])
+        elif not _processing_lock.acquire(blocking=False):
+            st.warning(t["already_processing"])
         else:
             # Reset state
             st.session_state.result = None
             st.session_state.error = None
+            st.session_state.cancelled = False
             st.session_state.unsupported_lang = None
             st.session_state.progress_log = []
             st.session_state.processing = True
@@ -312,7 +373,7 @@ def main():
                 target=_run_processing,
                 args=(shared, input_source, target_lang, model_size, dry_run,
                       convert_portrait, dub_audio, voice_gender, burn_subs,
-                      cookies_browser, cookies_file),
+                      cookies_browser, cookies_file, output_codec),
                 daemon=True,
             )
             thread.start()
@@ -326,6 +387,7 @@ def main():
             # Transfer results to session state and do a final rerun
             st.session_state.result = shared["result"]
             st.session_state.error = shared["error"]
+            st.session_state.cancelled = shared.get("cancelled", False)
             st.session_state.unsupported_lang = shared.get("unsupported_lang")
             st.session_state.progress_log = list(shared["progress_log"])
             st.session_state.processing = False
@@ -351,6 +413,10 @@ def main():
         else:
             st.progress(0, text=t["starting"])
 
+        # Cancel button
+        if st.button(t["cancel"], type="secondary"):
+            shared["cancel_event"].set()
+
         # Show processing log so far
         log = shared["progress_log"]
         detail_msgs = [u.message.strip() for u in log
@@ -364,6 +430,11 @@ def main():
         time.sleep(0.5)
         st.rerun()
 
+    # --- Cancelled display ---
+    if st.session_state.cancelled:
+        st.warning(t["cancelled"])
+        st.session_state.cancelled = False
+
     # --- Unsupported language prompt ---
     if st.session_state.unsupported_lang:
         detected_lang = st.session_state.unsupported_lang
@@ -371,22 +442,25 @@ def main():
         col_continue, col_stop, _ = st.columns([1, 1, 3])
         with col_continue:
             if st.button(t["continue_no_subs"]):
-                st.session_state.unsupported_lang = None
-                st.session_state.error = None
-                st.session_state.progress_log = []
-                st.session_state.processing = True
+                if not _processing_lock.acquire(blocking=False):
+                    st.warning(t["already_processing"])
+                else:
+                    st.session_state.unsupported_lang = None
+                    st.session_state.error = None
+                    st.session_state.progress_log = []
+                    st.session_state.processing = True
 
-                shared = _make_shared()
-                st.session_state.shared = shared
+                    shared = _make_shared()
+                    st.session_state.shared = shared
 
-                thread = threading.Thread(
-                    target=_run_processing,
-                    args=(shared, input_source, None, model_size, dry_run,
-                          convert_portrait, False, "male", False),
-                    daemon=True,
-                )
-                thread.start()
-                st.rerun()
+                    thread = threading.Thread(
+                        target=_run_processing,
+                        args=(shared, input_source, None, model_size, dry_run,
+                              convert_portrait, False, "male", False),
+                        daemon=True,
+                    )
+                    thread.start()
+                    st.rerun()
         with col_stop:
             if st.button(t["stop"]):
                 st.session_state.unsupported_lang = None

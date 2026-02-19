@@ -177,8 +177,27 @@ def extract_frames_dense(video_path, fps, region, ffmpeg_path, ffprobe_path):
     return frames, tmpdir, 1.0 / fps
 
 
-def ocr_frame(image_path):
-    """Run Tesseract OCR on a single frame. Returns extracted text."""
+_TESSERACT_LANG_MAP = {
+    "en": "eng", "es": "spa", "fr": "fra", "de": "deu", "pt": "por",
+    "it": "ita", "zh": "chi_sim", "ja": "jpn", "ko": "kor", "ar": "ara",
+    "ru": "rus", "hi": "hin", "nl": "nld", "pl": "pol", "tr": "tur",
+    "vi": "vie", "th": "tha", "sv": "swe", "da": "dan", "fi": "fin",
+}
+
+
+def get_tesseract_lang(iso_code):
+    """Map ISO 639-1 code to Tesseract language code, with fallback to eng."""
+    return _TESSERACT_LANG_MAP.get(iso_code, "eng")
+
+
+def ocr_frame(image_path, lang="eng"):
+    """Run Tesseract OCR on a single frame. Returns extracted text.
+
+    Args:
+        image_path: Path to the frame image.
+        lang: Tesseract language code (e.g. "eng", "spa"). Falls back to
+              "eng" if the specified language pack is not installed.
+    """
     import pytesseract
 
     img = Image.open(image_path)
@@ -188,10 +207,17 @@ def ocr_frame(image_path):
     # Scale up 2x for better OCR on small text
     img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
 
-    text = pytesseract.image_to_string(
-        img, lang="eng",
-        config="--psm 6",  # Assume a single uniform block of text
-    )
+    try:
+        text = pytesseract.image_to_string(
+            img, lang=lang,
+            config="--psm 6",  # Assume a single uniform block of text
+        )
+    except pytesseract.TesseractError:
+        # Language pack not installed — fall back to English
+        text = pytesseract.image_to_string(
+            img, lang="eng",
+            config="--psm 6",
+        )
     return text.strip()
 
 
@@ -245,7 +271,8 @@ def group_ocr_results(results, frame_interval, min_duration=0.4):
     return segments
 
 
-def detect_burned_in_subs(video_path, region, ffmpeg_path, ffprobe_path, log=print):
+def detect_burned_in_subs(video_path, region, ffmpeg_path, ffprobe_path,
+                          log=print, ocr_lang="eng"):
     """
     OCR-scan the given region for burned-in subtitles.
     Returns list of {start, end, text} segments, or empty list.
@@ -259,11 +286,11 @@ def detect_burned_in_subs(video_path, region, ffmpeg_path, ffprobe_path, log=pri
     if not frames:
         return []
 
-    log(f"  Running OCR on {len(frames)} frames...")
+    log(f"  Running OCR on {len(frames)} frames (lang={ocr_lang})...")
     results = []
     for i, fp in enumerate(frames):
         timestamp = i * interval
-        text = ocr_frame(fp)
+        text = ocr_frame(fp, lang=ocr_lang)
         results.append((timestamp, text))
         # Progress indicator every 20 frames
         if (i + 1) % 20 == 0:
@@ -437,6 +464,16 @@ def translate_segments(segments, source_lang, target_lang="es", log=print):
 _EDGE_TTS_VOICES = {
     "es": {"male": "es-MX-JorgeNeural", "female": "es-MX-DaliaNeural"},
     "en": {"male": "en-US-GuyNeural", "female": "en-US-JennyNeural"},
+    "fr": {"male": "fr-FR-HenriNeural", "female": "fr-FR-DeniseNeural"},
+    "de": {"male": "de-DE-ConradNeural", "female": "de-DE-KatjaNeural"},
+    "pt": {"male": "pt-BR-AntonioNeural", "female": "pt-BR-FranciscaNeural"},
+    "it": {"male": "it-IT-DiegoNeural", "female": "it-IT-ElsaNeural"},
+    "ja": {"male": "ja-JP-KeitaNeural", "female": "ja-JP-NanamiNeural"},
+    "ko": {"male": "ko-KR-InJoonNeural", "female": "ko-KR-SunHiNeural"},
+    "zh": {"male": "zh-CN-YunxiNeural", "female": "zh-CN-XiaoxiaoNeural"},
+    "ru": {"male": "ru-RU-DmitryNeural", "female": "ru-RU-SvetlanaNeural"},
+    "ar": {"male": "ar-SA-HamedNeural", "female": "ar-SA-ZariyahNeural"},
+    "hi": {"male": "hi-IN-MadhurNeural", "female": "hi-IN-SwaraNeural"},
 }
 
 SAMPLE_RATE = 24000
@@ -454,9 +491,12 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
 
     lang_voices = _EDGE_TTS_VOICES.get(target_lang)
     if not lang_voices:
+        lang_name = _LANG_NAMES.get(target_lang, target_lang)
         raise ValueError(
-            f"No TTS voice configured for language '{target_lang}'. "
-            f"Supported: {', '.join(sorted(_EDGE_TTS_VOICES))}"
+            f"No TTS voice configured for '{lang_name}' ({target_lang}). "
+            f"Supported languages for dubbing: "
+            f"{', '.join(sorted(_EDGE_TTS_VOICES))}. "
+            f"Try using subtitles-only mode instead."
         )
     voice = lang_voices.get(voice_gender, lang_voices["male"])
 
@@ -646,17 +686,27 @@ def _ass_time(seconds):
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+_LANG_NAMES = {
+    "es": "Spanish", "en": "English", "fr": "French", "de": "German",
+    "pt": "Portuguese", "it": "Italian", "ja": "Japanese", "ko": "Korean",
+    "zh": "Chinese", "ru": "Russian", "ar": "Arabic", "hi": "Hindi",
+    "nl": "Dutch", "pl": "Polish", "tr": "Turkish", "vi": "Vietnamese",
+    "th": "Thai", "sv": "Swedish", "da": "Danish", "fi": "Finnish",
+}
+
+
 def generate_ass(segments, position, margin, width, height, output_path,
-                 font_size=None):
+                 font_size=None, target_lang=None):
     """Write an ASS subtitle file with styling and positioning."""
     if font_size is None:
         font_size = max(18, int(height * 0.05))
 
     alignment = 8 if position == "top" else 2
+    lang_name = _LANG_NAMES.get(target_lang, target_lang or "Translated")
 
     header = (
         "[Script Info]\n"
-        "Title: Auto-generated Spanish Subtitles\n"
+        f"Title: Auto-generated {lang_name} Subtitles\n"
         "ScriptType: v4.00+\n"
         f"PlayResX: {width}\n"
         f"PlayResY: {height}\n"
@@ -713,8 +763,13 @@ def save_srt(segments, output_path):
 # Burn-in
 # ---------------------------------------------------------------------------
 
-def burn_subtitles(video_path, ass_path, output_path, ffmpeg_path):
-    """Burn ASS subtitles into the video with libx264 + AAC."""
+def burn_subtitles(video_path, ass_path, output_path, ffmpeg_path,
+                   output_codec="h264"):
+    """Burn ASS subtitles into the video.
+
+    Note: subtitle burn-in requires a video filter, so re-encoding is
+    mandatory even when output_codec is "copy".
+    """
     tmp_ass = tempfile.NamedTemporaryFile(
         suffix=".ass", delete=False, prefix="subs_"
     )
@@ -724,11 +779,18 @@ def burn_subtitles(video_path, ass_path, output_path, ffmpeg_path):
 
     escaped = tmp_ass.name.replace("\\", "/").replace(":", "\\:")
 
+    # Video filter present → always re-encode video as H.264
+    v_codec = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+    # Audio can be copied when no new audio is mixed in
+    if output_codec == "copy":
+        a_codec = ["-c:a", "copy"]
+    else:
+        a_codec = ["-c:a", "aac", "-b:a", "128k"]
+
     cmd = [
         ffmpeg_path, "-i", video_path,
         "-vf", f"ass={escaped}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
+    ] + v_codec + a_codec + [
         "-movflags", "+faststart",
         "-y", output_path,
     ]
@@ -931,7 +993,7 @@ def main():
     save_srt(segments, srt_path)
     print(f"  SRT saved: {srt_path}")
     generate_ass(segments, position, margin, width, height, ass_path,
-                 font_size=args.font_size)
+                 font_size=args.font_size, target_lang=target)
     print(f"  ASS saved: {ass_path}")
 
     if args.srt_only:
