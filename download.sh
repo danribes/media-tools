@@ -22,12 +22,10 @@ echo ""
 
 yt-dlp \
     --ffmpeg-location "$SCRIPT_DIR/bin" \
-    -f "bestvideo+bestaudio/best" \
+    -f "bv*+ba/b" \
     --merge-output-format mp4 \
     -o "$DOWNLOADS_DIR/%(title).80s [%(id)s].%(ext)s" \
     --no-playlist \
-    --embed-thumbnail \
-    --embed-metadata \
     "$@" \
     "$URL"
 

@@ -785,12 +785,10 @@ def download_url(url, base_dir=None, on_progress=print_progress, cookies_browser
 
     cmd = [
         "yt-dlp",
-        "-f", "bestvideo+bestaudio/best",
+        "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
         "-o", os.path.join(downloads_dir, "%(title).80s [%(id)s].%(ext)s"),
         "--no-playlist",
-        "--embed-thumbnail",
-        "--embed-metadata",
     ]
     if ffmpeg_dir:
         cmd += ["--ffmpeg-location", ffmpeg_dir]
