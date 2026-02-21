@@ -477,6 +477,7 @@ def _ffmpeg_convert_and_burn(input_path, ass_path, output_path,
     # Video filters present → re-encoding required regardless of codec choice
     cmd = [
         ffmpeg_path, "-i", input_path,
+        "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", f"scale={width}:{height},setsar=1,ass={escaped}",
     ]
     cmd += _video_codec_args(output_codec, has_video_filters=True)
@@ -733,6 +734,7 @@ def execute_pipeline(video_path, actions, target_lang, audio_lang,
         # Scaling requires re-encoding regardless of codec choice
         cmd = [
             ffmpeg, "-i", video_path,
+            "-map", "0:v:0", "-map", "0:a:0?",
             "-vf", f"scale={target_w}:{target_h},setsar=1",
         ]
         cmd += _video_codec_args(output_codec, has_video_filters=True)

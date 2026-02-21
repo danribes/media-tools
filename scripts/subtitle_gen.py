@@ -789,6 +789,7 @@ def burn_subtitles(video_path, ass_path, output_path, ffmpeg_path,
 
     cmd = [
         ffmpeg_path, "-i", video_path,
+        "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", f"ass={escaped}",
     ] + v_codec + a_codec + [
         "-movflags", "+faststart",

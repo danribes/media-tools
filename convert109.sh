@@ -58,6 +58,7 @@ echo "File:    $OUTPUT"
 echo ""
 
 "$FFMPEG" -i "$INPUT" \
+    -map 0:v:0 -map 0:a:0? \
     -vf "scale=${NEW_W}:${NEW_H},setsar=1" \
     -c:v libx264 -preset fast -crf 23 \
     -c:a aac -b:a 128k \
