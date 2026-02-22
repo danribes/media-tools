@@ -479,13 +479,35 @@ _EDGE_TTS_VOICES = {
 SAMPLE_RATE = 24000
 
 
+def _decode_mp3_to_pcm(mp3_path, ffmpeg_path, atempo=None):
+    """Decode an MP3 to raw float32 PCM, optionally applying atempo."""
+    cmd = [ffmpeg_path, "-v", "error", "-i", mp3_path]
+    if atempo and atempo > 1.001:
+        # Build atempo filter chain (each filter limited to 2.0x)
+        parts, s = [], atempo
+        while s > 2.0:
+            parts.append("atempo=2.0")
+            s /= 2.0
+        parts.append(f"atempo={s:.4f}")
+        cmd += ["-af", ",".join(parts)]
+    cmd += [
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "-ar", str(SAMPLE_RATE), "-ac", "1", "pipe:1",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=True)
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
+MAX_DUB_SPEED = 2.5  # Cap per-segment speed-up to keep speech intelligible
+
+
 def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
                             ffmpeg_path, voice_gender="male", log=print):
     """Generate a full-length WAV with TTS speech placed at segment timestamps.
 
-    For each segment, edge-tts produces an MP3 which is decoded to raw PCM via
-    ffmpeg, then mixed (additive) into a silent buffer spanning the entire video
-    duration.  The result is written as a 16-bit WAV file.
+    Each segment's TTS is individually time-stretched to match the original
+    speech duration, keeping the dub synchronized with the video.  Segments
+    where TTS is already shorter than the original play at natural speed.
     """
     import edge_tts
 
@@ -507,16 +529,11 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
     mp3_paths = []
 
     try:
-        # Sort by start time so each segment's audio window is bounded
-        # by the next segment's start, preventing overlapping speech.
         segments = sorted(segments, key=lambda s: s["start"])
 
-        # --- Pass 1: generate all TTS clips and measure durations ---
-        seg_info = []  # [(mp3_path, tts_samples, max_samples), ...]
         for i, seg in enumerate(segments):
             text = seg["text"].strip()
             if not text:
-                seg_info.append(None)
                 continue
 
             mp3_path = os.path.join(tmpdir, f"seg_{i:04d}.mp3")
@@ -525,113 +542,36 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
             comm = edge_tts.Communicate(text, voice)
             asyncio.run(comm.save(mp3_path))
 
-            # Decode to get raw duration
-            decode_cmd = [
-                ffmpeg_path, "-v", "error",
-                "-i", mp3_path,
-                "-f", "f32le",
-                "-acodec", "pcm_f32le",
-                "-ar", str(SAMPLE_RATE),
-                "-ac", "1",
-                "pipe:1",
-            ]
-            proc = subprocess.run(decode_cmd, capture_output=True, check=True)
-            tts_samples = len(proc.stdout) // 4  # float32 = 4 bytes
+            # Decode at natural speed to measure TTS duration
+            raw_pcm = _decode_mp3_to_pcm(mp3_path, ffmpeg_path)
+            tts_duration = len(raw_pcm) / SAMPLE_RATE
+            original_duration = seg["end"] - seg["start"]
 
-            next_start = (segments[i + 1]["start"]
-                          if i + 1 < len(segments) else video_duration)
-            max_samples = int((next_start - seg["start"]) * SAMPLE_RATE)
-
-            seg_info.append((mp3_path, tts_samples, max_samples))
-
-            if (i + 1) % 10 == 0 or i + 1 == len(segments):
-                log(f"  TTS: {i + 1}/{len(segments)} segments generated")
-
-        # --- Compute the minimum uniform speed that fits everything ---
-        # Each segment can delay its start if the previous one hasn't
-        # finished, so tight segments borrow slack from generous ones.
-        # Binary-search for the lowest speed where the last segment's
-        # audio ends before the video does — no trimming needed.
-        active = [(i, info) for i, info in enumerate(seg_info) if info]
-
-        def _fits(speed):
-            """Check if all segments fit at the given speed."""
-            cursor = 0.0
-            for idx, (_, tts_s, _) in active:
-                orig_start = segments[idx]["start"]
-                start = max(orig_start, cursor)
-                cursor = start + tts_s / (speed * SAMPLE_RATE)
-            return cursor <= video_duration
-
-        lo, hi = 1.0, 3.0
-        if _fits(lo):
-            uniform_speed = 1.0
-        else:
-            # Binary search (20 iterations gives ~1e-6 precision)
-            for _ in range(20):
-                mid = (lo + hi) / 2
-                if _fits(mid):
-                    hi = mid
-                else:
-                    lo = mid
-            uniform_speed = hi
-
-        if uniform_speed > 1.001:
-            log(f"  TTS uniform speed: {uniform_speed:.2f}x")
-
-        # --- Compute adjusted start times with the chosen speed ---
-        adjusted_starts = {}
-        cursor = 0.0
-        for idx, (_, tts_s, _) in active:
-            orig_start = segments[idx]["start"]
-            start = max(orig_start, cursor)
-            adjusted_starts[idx] = start
-            cursor = start + tts_s / (uniform_speed * SAMPLE_RATE)
-
-        # --- Pass 2: decode with uniform atempo and place in buffer ---
-        for idx, (mp3_path, tts_samples, max_samples) in active:
-            if uniform_speed > 1.001:
-                # Build atempo filter chain (each filter limited to 2.0x)
-                parts, s = [], uniform_speed
-                while s > 2.0:
-                    parts.append("atempo=2.0")
-                    s /= 2.0
-                parts.append(f"atempo={s:.4f}")
-                af = ",".join(parts)
-
-                tempo_cmd = [
-                    ffmpeg_path, "-v", "error",
-                    "-i", mp3_path,
-                    "-af", af,
-                    "-f", "f32le",
-                    "-acodec", "pcm_f32le",
-                    "-ar", str(SAMPLE_RATE),
-                    "-ac", "1",
-                    "pipe:1",
-                ]
-                proc = subprocess.run(tempo_cmd, capture_output=True,
-                                      check=True)
-                pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+            # Per-segment speed: only speed up, never slow down
+            if tts_duration > original_duration and original_duration > 0:
+                speed = min(tts_duration / original_duration, MAX_DUB_SPEED)
             else:
-                decode_cmd = [
-                    ffmpeg_path, "-v", "error",
-                    "-i", mp3_path,
-                    "-f", "f32le",
-                    "-acodec", "pcm_f32le",
-                    "-ar", str(SAMPLE_RATE),
-                    "-ac", "1",
-                    "pipe:1",
-                ]
-                proc = subprocess.run(decode_cmd, capture_output=True,
-                                      check=True)
-                pcm = np.frombuffer(proc.stdout, dtype=np.float32)
+                speed = 1.0
 
-            # Place at the adjusted start offset (additive mix)
-            offset = int(adjusted_starts[idx] * SAMPLE_RATE)
+            # Re-decode with atempo if needed
+            if speed > 1.001:
+                pcm = _decode_mp3_to_pcm(mp3_path, ffmpeg_path, atempo=speed)
+                log(f"  Seg {i + 1}: {tts_duration:.1f}s TTS -> "
+                    f"{original_duration:.1f}s slot ({speed:.2f}x)")
+            else:
+                pcm = raw_pcm
+
+            # Place at original start, trim to original duration
+            offset = int(seg["start"] * SAMPLE_RATE)
+            max_len = int(original_duration * SAMPLE_RATE)
+            pcm = pcm[:max_len]
             end = min(offset + len(pcm), total_samples)
             length = end - offset
             if length > 0:
                 mixed[offset:end] += pcm[:length]
+
+            if (i + 1) % 10 == 0 or i + 1 == len(segments):
+                log(f"  TTS: {i + 1}/{len(segments)} segments placed")
 
         # Clip to [-1, 1] and convert to int16
         np.clip(mixed, -1.0, 1.0, out=mixed)
