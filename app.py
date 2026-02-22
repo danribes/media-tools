@@ -346,8 +346,17 @@ def main():
             downloads_dir = os.path.join(BASE_DIR, "downloads")
             os.makedirs(downloads_dir, exist_ok=True)
             save_path = os.path.join(downloads_dir, uploaded.name)
-            with open(save_path, "wb") as f:
-                f.write(uploaded.getbuffer())
+            # Only write if the file doesn't already match (avoids overwriting
+            # during Streamlit reruns while ffmpeg is reading the file).
+            need_write = (
+                not os.path.isfile(save_path)
+                or os.path.getsize(save_path) != uploaded.size
+            )
+            if need_write:
+                tmp_path = save_path + ".tmp"
+                with open(tmp_path, "wb") as f:
+                    f.write(uploaded.getbuffer())
+                os.replace(tmp_path, save_path)  # atomic on same filesystem
             input_source = save_path
             st.success(t["saved_to"].format(path=save_path))
 
