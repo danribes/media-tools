@@ -222,15 +222,16 @@ def _quick_ocr_sample(video_path, ffmpeg_path, width, height, duration):
 
 def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_lang,
                    width, height, sub_lang=None, convert_portrait=True,
-                   existing_srt_lang=None):
+                   existing_srt_lang=None, dub_audio=False):
     """
     Decision matrix:
-      Audio Language | Has Burned-in Subs | Subs Language | Action
-      target         | Yes                | *             | Skip subtitles
-      target         | No                 | *             | Transcribe only (no translation)
-      other          | Yes                | target        | Skip subtitles (already in target)
-      other          | Yes                | other/unknown | Whisper transcribe + translate
-      other          | No                 | *             | Whisper transcribe + translate
+      Audio Language | Has Burned-in Subs | Subs Language | Dub? | Action
+      target         | Yes                | *             | *    | Skip subtitles
+      target         | No                 | *             | *    | Transcribe only (no translation)
+      other          | Yes                | target        | No   | Skip subtitles (already in target)
+      other          | Yes                | target        | Yes  | Whisper + translate (need segments for dub)
+      other          | Yes                | other/unknown | *    | Whisper transcribe + translate
+      other          | No                 | *             | *    | Whisper transcribe + translate
 
     Additionally: convert to 10:9 if portrait (height > width) and not already 10:9.
     Landscape videos are left at their original aspect ratio.
@@ -290,10 +291,16 @@ def decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs, target_la
             "reason": f"Audio is '{audio_lang}' (target), no burned-in subs — transcribe without translation",
         })
     elif not audio_is_target and has_burned_subs and subs_are_target:
-        actions.append({
-            "type": "skip_subs",
-            "reason": f"Burned-in subs detected in '{sub_lang}' (target language) — no new subtitles needed",
-        })
+        if dub_audio:
+            actions.append({
+                "type": "whisper_translate",
+                "reason": f"Audio is '{audio_lang}', burned-in subs in '{sub_lang}' (target) — Whisper + translate to {target_lang} for dubbing",
+            })
+        else:
+            actions.append({
+                "type": "skip_subs",
+                "reason": f"Burned-in subs detected in '{sub_lang}' (target language) — no new subtitles needed",
+            })
     elif not audio_is_target and has_burned_subs:
         sub_info = f" (detected as '{sub_lang}')" if sub_lang else ""
         actions.append({
@@ -1069,7 +1076,8 @@ def process_video(input_source, target_lang="es", model_size="small",
     actions = decide_actions(is_10_9, actual_ratio, audio_lang, has_burned_subs,
                              target_lang, width, height, sub_lang,
                              convert_portrait=convert_portrait,
-                             existing_srt_lang=existing_srt_lang)
+                             existing_srt_lang=existing_srt_lang,
+                             dub_audio=dub_audio)
     result["actions"] = actions
 
     plan_text = _format_plan(actions, video_path, dry_run=dry_run)
