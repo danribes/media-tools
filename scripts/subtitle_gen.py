@@ -547,23 +547,36 @@ def synthesize_dubbed_audio(segments, target_lang, video_duration, output_path,
             tts_duration = len(raw_pcm) / SAMPLE_RATE
             original_duration = seg["end"] - seg["start"]
 
-            # Per-segment speed: only speed up, never slow down
+            # Per-segment speed: only speed up, never slow down.
+            # When TTS is longer than the original slot, extend into the
+            # gap before the next segment to reduce the required speed-up.
             if tts_duration > original_duration and original_duration > 0:
-                speed = min(tts_duration / original_duration, MAX_DUB_SPEED)
+                if i + 1 < len(segments):
+                    gap = segments[i + 1]["start"] - seg["end"]
+                else:
+                    gap = video_duration - seg["end"]
+                gap = max(gap, 0)
+                available_duration = original_duration + gap
+                speed = tts_duration / available_duration
+                if speed < 1.0:
+                    speed = 1.0
+                speed = min(speed, MAX_DUB_SPEED)
+                slot_duration = available_duration
             else:
                 speed = 1.0
+                slot_duration = original_duration
 
             # Re-decode with atempo if needed
             if speed > 1.001:
                 pcm = _decode_mp3_to_pcm(mp3_path, ffmpeg_path, atempo=speed)
                 log(f"  Seg {i + 1}: {tts_duration:.1f}s TTS -> "
-                    f"{original_duration:.1f}s slot ({speed:.2f}x)")
+                    f"{slot_duration:.1f}s slot ({speed:.2f}x)")
             else:
                 pcm = raw_pcm
 
-            # Place at original start, trim to original duration
+            # Place at original start, trim to available slot
             offset = int(seg["start"] * SAMPLE_RATE)
-            max_len = int(original_duration * SAMPLE_RATE)
+            max_len = int(slot_duration * SAMPLE_RATE)
             pcm = pcm[:max_len]
             end = min(offset + len(pcm), total_samples)
             length = end - offset
