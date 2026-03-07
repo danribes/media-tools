@@ -9,6 +9,7 @@ services:
       - whisper-cache:/root/.cache/huggingface
     environment:
       - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=500
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     restart: unless-stopped
 
 volumes:

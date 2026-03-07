@@ -18,7 +18,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scr
 
 from progress import ProgressUpdate, format_time
 from auto_process import process_video, is_url, CancelledError
-from subtitle_gen import UnsupportedLanguageError
+from subtitle_gen import UnsupportedLanguageError, transcribe_audio, load_whisper_model
+from clip_extractor import (
+    analyse_content_llm, analyse_content_fixed, analyse_content_silence,
+    process_clips, create_clips_zip,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -93,6 +97,32 @@ TRANSLATIONS = {
         "cancel": "Cancel",
         "cancelled": "Processing was cancelled.",
         "already_processing": "Another video is already being processed. Please wait for it to finish.",
+        # Clip extractor
+        "clip_analyse": "Analyse & Extract Clips",
+        "clip_api_key": "Anthropic API Key",
+        "clip_split_mode": "Split mode",
+        "clip_split_llm": "AI content analysis",
+        "clip_split_fixed": "Fixed duration",
+        "clip_split_silence": "Silence gaps",
+        "clip_chunk_minutes": "Chunk duration (min)",
+        "clip_silence_gap": "Min silence gap (sec)",
+        "clip_analysing": "Analysing content...",
+        "clip_sections_found": "Sections found: {count}",
+        "clip_global_settings": "Clip output settings",
+        "clip_select_all": "Select all",
+        "clip_deselect_all": "Deselect all",
+        "clip_extract": "Extract selected clips",
+        "clip_extracting": "Extracting clip {current}/{total}: {title}",
+        "clip_done": "Clips ready: {count}",
+        "clip_download_all": "Download all (ZIP)",
+        "clip_no_sections": "No sections found.",
+        "clip_no_selected": "No sections selected.",
+        "clip_preview": "Preview",
+        "clip_edit": "Edit",
+        "clip_title": "Title",
+        "clip_start": "Start (sec)",
+        "clip_end": "End (sec)",
+        "clip_summary": "Summary",
     },
     "es": {
         "caption": "Procesar videos: descargar, convertir, subtitular, traducir",
@@ -160,6 +190,32 @@ TRANSLATIONS = {
         "cancel": "Cancelar",
         "cancelled": "El procesamiento fue cancelado.",
         "already_processing": "Otro video ya se est\u00e1 procesando. Espere a que termine.",
+        # Clip extractor
+        "clip_analyse": "Analizar y extraer clips",
+        "clip_api_key": "API Key de Anthropic",
+        "clip_split_mode": "Modo de segmentaci\u00f3n",
+        "clip_split_llm": "An\u00e1lisis de contenido con IA",
+        "clip_split_fixed": "Duraci\u00f3n fija",
+        "clip_split_silence": "Pausas de silencio",
+        "clip_chunk_minutes": "Duraci\u00f3n del segmento (min)",
+        "clip_silence_gap": "Pausa m\u00ednima de silencio (seg)",
+        "clip_analysing": "Analizando contenido...",
+        "clip_sections_found": "Secciones encontradas: {count}",
+        "clip_global_settings": "Configuraci\u00f3n de clips",
+        "clip_select_all": "Seleccionar todo",
+        "clip_deselect_all": "Deseleccionar todo",
+        "clip_extract": "Extraer clips seleccionados",
+        "clip_extracting": "Extrayendo clip {current}/{total}: {title}",
+        "clip_done": "Clips listos: {count}",
+        "clip_download_all": "Descargar todo (ZIP)",
+        "clip_no_sections": "No se encontraron secciones.",
+        "clip_no_selected": "Ninguna secci\u00f3n seleccionada.",
+        "clip_preview": "Vista previa",
+        "clip_edit": "Editar",
+        "clip_title": "T\u00edtulo",
+        "clip_start": "Inicio (seg)",
+        "clip_end": "Fin (seg)",
+        "clip_summary": "Resumen",
     },
 }
 
@@ -176,6 +232,14 @@ def init_session_state():
         # Plain dict shared with background thread.  st.session_state is
         # thread-local in Streamlit so the worker writes here instead.
         "shared": None,
+        # Clip extractor state
+        "clip_sections": None,       # list[dict] from analysis
+        "clip_transcript": None,     # list[dict] raw Whisper segments
+        "clip_results": None,        # list[dict] extraction results
+        "clip_processing": False,
+        "clip_error": None,
+        "clip_video_path": None,
+        "clip_audio_lang": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -567,6 +631,389 @@ def main():
                         )
         elif not video_path:
             st.info(t["no_output"])
+
+        # === Clip Extractor Section ===
+        _render_clip_extractor(t, result, target_lang, model_size,
+                               dub_audio, voice_gender, burn_subs,
+                               output_codec)
+
+
+# ---------------------------------------------------------------------------
+# Clip extractor UI
+# ---------------------------------------------------------------------------
+
+def _run_clip_analysis(shared, video_path, audio_lang, model_size, api_key,
+                       split_mode, chunk_minutes, silence_gap):
+    """Background thread: transcribe + analyse content."""
+    try:
+        log_fn = _make_callback(shared)
+        log_fn(ProgressUpdate("execution", "Transcribing audio for analysis...", 0.1))
+
+        model = load_whisper_model(model_size)
+        segments, detected = transcribe_audio(
+            video_path, audio_lang, model_size, model=model,
+            log=lambda m: log_fn(ProgressUpdate("execution", m, -1)),
+        )
+        shared["transcript"] = segments
+        shared["audio_lang"] = detected
+
+        # Get video duration
+        from subtitle_gen import get_video_info
+        ffprobe = os.path.join(BASE_DIR, "bin", "ffprobe")
+        if not os.path.isfile(ffprobe):
+            ffprobe = "ffprobe"
+        _, _, duration, _ = get_video_info(video_path, ffprobe)
+
+        log_fn(ProgressUpdate("execution", "Segmenting content...", 0.7))
+
+        if split_mode == "llm" and api_key:
+            sections = analyse_content_llm(
+                segments, api_key, duration,
+                log=lambda m: log_fn(ProgressUpdate("execution", m, -1)),
+            )
+        elif split_mode == "silence":
+            sections = analyse_content_silence(
+                segments, duration, min_gap=silence_gap,
+                log=lambda m: log_fn(ProgressUpdate("execution", m, -1)),
+            )
+        else:
+            sections = analyse_content_fixed(
+                segments, duration, chunk_minutes=chunk_minutes,
+                log=lambda m: log_fn(ProgressUpdate("execution", m, -1)),
+            )
+
+        shared["sections"] = sections
+        log_fn(ProgressUpdate("execution", f"Analysis complete: {len(sections)} sections.", 1.0))
+    except CancelledError:
+        shared["cancelled"] = True
+    except Exception as e:
+        shared["error"] = str(e)
+    finally:
+        shared["processing"] = False
+
+
+def _run_clip_extraction(shared, video_path, sections, target_lang, audio_lang,
+                         model_size, dub_audio, voice_gender, burn_subs,
+                         output_codec):
+    """Background thread: extract and process clips."""
+    try:
+        log_fn = _make_callback(shared)
+        ffmpeg = os.path.join(BASE_DIR, "bin", "ffmpeg")
+        ffprobe = os.path.join(BASE_DIR, "bin", "ffprobe")
+        if not os.path.isfile(ffmpeg):
+            ffmpeg = "ffmpeg"
+        if not os.path.isfile(ffprobe):
+            ffprobe = "ffprobe"
+
+        from subtitle_gen import get_video_info
+        _, _, duration, _ = get_video_info(video_path, ffprobe)
+        w, h = 0, 0
+        try:
+            w, h, _, _ = get_video_info(video_path, ffprobe)
+        except Exception:
+            pass
+
+        results = process_clips(
+            video_path, sections,
+            target_lang=target_lang,
+            audio_lang=audio_lang,
+            whisper_model=model_size,
+            width=w, height=h,
+            ffmpeg_path=ffmpeg, ffprobe_path=ffprobe,
+            base_dir=BASE_DIR,
+            on_progress=log_fn,
+            dub_audio=dub_audio,
+            voice_gender=voice_gender,
+            burn_subs=burn_subs,
+            output_codec=output_codec,
+            cancel_event=shared["cancel_event"],
+            duration=duration,
+        )
+        shared["clip_results"] = results
+    except CancelledError:
+        shared["cancelled"] = True
+    except Exception as e:
+        shared["error"] = str(e)
+    finally:
+        shared["processing"] = False
+
+
+def _render_clip_extractor(t, result, target_lang, model_size,
+                           dub_audio, voice_gender, burn_subs,
+                           output_codec):
+    """Render the clip extractor UI within the results area."""
+
+    st.divider()
+    st.subheader(t["clip_analyse"])
+
+    # --- Settings row ---
+    col_mode, col_key = st.columns([1, 2])
+    with col_mode:
+        split_options = [t["clip_split_llm"], t["clip_split_fixed"],
+                         t["clip_split_silence"]]
+        split_mode_label = st.selectbox(t["clip_split_mode"], split_options,
+                                        index=0)
+        split_mode_map = {
+            t["clip_split_llm"]: "llm",
+            t["clip_split_fixed"]: "fixed",
+            t["clip_split_silence"]: "silence",
+        }
+        split_mode = split_mode_map[split_mode_label]
+
+    with col_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if split_mode == "llm":
+            api_key_input = st.text_input(
+                t["clip_api_key"], value=api_key, type="password",
+            )
+            if api_key_input:
+                api_key = api_key_input
+
+    # Extra settings for non-LLM modes
+    chunk_minutes = 5
+    silence_gap = 3.0
+    if split_mode == "fixed":
+        chunk_minutes = st.slider(t["clip_chunk_minutes"], 1, 30, 5)
+    elif split_mode == "silence":
+        silence_gap = st.slider(t["clip_silence_gap"], 1.0, 15.0, 3.0, 0.5)
+
+    # Source video path from the processed result
+    video_path = result.get("output_video") or st.session_state.get("clip_video_path")
+    # Use original video if available (better quality for clip extraction)
+    assessment = result.get("assessment", {})
+    audio_lang = assessment.get("audio_lang", "en")
+
+    # If the result has a source video path, prefer it
+    source_video = None
+    for update in st.session_state.progress_log:
+        if update.phase == "download" and "Downloaded:" in update.message:
+            m = re.search(r'Downloaded:\s+(.+\.mp4)', update.message)
+            if m and os.path.isfile(m.group(1)):
+                source_video = m.group(1)
+    if not source_video:
+        source_video = video_path
+
+    if not source_video or not os.path.isfile(source_video):
+        return
+
+    # --- Analyse button ---
+    if st.session_state.clip_sections is None and not st.session_state.clip_processing:
+        if st.button(t["clip_analyse"], key="clip_analyse_btn", type="primary"):
+            if split_mode == "llm" and not api_key:
+                st.error("API key required for AI content analysis.")
+                return
+            if not _processing_lock.acquire(blocking=False):
+                st.warning(t["already_processing"])
+                return
+
+            st.session_state.clip_processing = True
+            shared = _make_shared()
+            shared["transcript"] = None
+            shared["sections"] = None
+            st.session_state.shared = shared
+            st.session_state.clip_video_path = source_video
+
+            thread = threading.Thread(
+                target=_run_clip_analysis,
+                args=(shared, source_video, audio_lang, model_size,
+                      api_key, split_mode, chunk_minutes, silence_gap),
+                daemon=True,
+            )
+            thread.start()
+            st.rerun()
+
+    # --- Analysis in progress ---
+    if st.session_state.clip_processing:
+        shared = st.session_state.shared
+        if shared and not shared["processing"]:
+            # Analysis finished
+            if shared.get("error"):
+                st.session_state.clip_error = shared["error"]
+            elif shared.get("sections"):
+                st.session_state.clip_sections = shared["sections"]
+                st.session_state.clip_transcript = shared.get("transcript")
+                st.session_state.clip_audio_lang = shared.get("audio_lang", audio_lang)
+            st.session_state.clip_processing = False
+            st.session_state.shared = None
+            _processing_lock.release()
+            st.rerun()
+        else:
+            st.progress(0.5, text=t["clip_analysing"])
+            if st.button(t["cancel"], key="clip_cancel_analyse"):
+                if shared:
+                    shared["cancel_event"].set()
+            time.sleep(1)
+            st.rerun()
+        return
+
+    # --- Error display ---
+    if st.session_state.clip_error:
+        st.error(t["processing_failed"].format(error=st.session_state.clip_error))
+        st.session_state.clip_error = None
+
+    # --- Section review ---
+    sections = st.session_state.clip_sections
+    if sections is not None and st.session_state.clip_results is None:
+        st.success(t["clip_sections_found"].format(count=len(sections)))
+
+        # Select/deselect all
+        col_sel, col_desel, _ = st.columns([1, 1, 4])
+        with col_sel:
+            if st.button(t["clip_select_all"]):
+                for s in sections:
+                    s["selected"] = True
+                st.rerun()
+        with col_desel:
+            if st.button(t["clip_deselect_all"]):
+                for s in sections:
+                    s["selected"] = False
+                st.rerun()
+
+        # Render each section
+        for idx, section in enumerate(sections):
+            duration_str = f"{section['start']:.0f}s – {section['end']:.0f}s"
+            dur_secs = section['end'] - section['start']
+            label = f"{section['title']}  ({duration_str}, {dur_secs:.0f}s)"
+
+            col_check, col_info = st.columns([0.05, 0.95])
+            with col_check:
+                checked = st.checkbox(
+                    "", value=section.get("selected", True),
+                    key=f"clip_sel_{idx}", label_visibility="collapsed",
+                )
+                section["selected"] = checked
+            with col_info:
+                with st.expander(label, expanded=False):
+                    st.write(section.get("summary", ""))
+                    # Inline editing
+                    new_title = st.text_input(
+                        t["clip_title"], value=section["title"],
+                        key=f"clip_title_{idx}",
+                    )
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        new_start = st.number_input(
+                            t["clip_start"], value=section["start"],
+                            min_value=0.0, step=1.0, key=f"clip_start_{idx}",
+                        )
+                    with c2:
+                        new_end = st.number_input(
+                            t["clip_end"], value=section["end"],
+                            min_value=0.0, step=1.0, key=f"clip_end_{idx}",
+                        )
+                    section["title"] = new_title
+                    section["start"] = new_start
+                    section["end"] = new_end
+
+        # --- Extract button ---
+        selected_count = sum(1 for s in sections if s.get("selected"))
+        if selected_count == 0:
+            st.info(t["clip_no_selected"])
+        else:
+            if st.button(t["clip_extract"], type="primary", key="clip_extract_btn"):
+                if not _processing_lock.acquire(blocking=False):
+                    st.warning(t["already_processing"])
+                    return
+
+                st.session_state.clip_processing = True
+                shared = _make_shared()
+                shared["clip_results"] = None
+                st.session_state.shared = shared
+
+                clip_video = st.session_state.clip_video_path or source_video
+                clip_audio_lang = st.session_state.clip_audio_lang or audio_lang
+
+                thread = threading.Thread(
+                    target=_run_clip_extraction,
+                    args=(shared, clip_video, sections, target_lang,
+                          clip_audio_lang, model_size, dub_audio,
+                          voice_gender, burn_subs, output_codec),
+                    daemon=True,
+                )
+                thread.start()
+                st.rerun()
+
+    # --- Extraction in progress ---
+    if st.session_state.clip_processing and st.session_state.clip_sections is not None:
+        shared = st.session_state.shared
+        if shared and not shared["processing"]:
+            if shared.get("error"):
+                st.session_state.clip_error = shared["error"]
+            elif shared.get("clip_results"):
+                st.session_state.clip_results = shared["clip_results"]
+            st.session_state.clip_processing = False
+            st.session_state.shared = None
+            _processing_lock.release()
+            st.rerun()
+        else:
+            log = shared["progress_log"] if shared else []
+            # Show latest execution message
+            exec_msgs = [u.message.strip() for u in log
+                         if u.phase == "execution" and u.message.strip()]
+            if exec_msgs:
+                st.progress(0.5, text=exec_msgs[-1])
+            else:
+                st.progress(0.3, text=t["clip_extracting"].format(
+                    current="?", total="?", title="..."))
+            if st.button(t["cancel"], key="clip_cancel_extract"):
+                if shared:
+                    shared["cancel_event"].set()
+            time.sleep(1)
+            st.rerun()
+        return
+
+    # --- Clip results ---
+    clip_results = st.session_state.clip_results
+    if clip_results:
+        st.success(t["clip_done"].format(count=len(clip_results)))
+
+        for i, cr in enumerate(clip_results):
+            video_file = cr.get("output_path")
+            if video_file and os.path.isfile(video_file):
+                with st.expander(f"{i + 1}. {cr['title']}", expanded=False):
+                    st.video(video_file)
+                    dl_cols = st.columns(3)
+                    with dl_cols[0]:
+                        with open(video_file, "rb") as f:
+                            st.download_button(
+                                t["download_video"],
+                                f.read(),
+                                file_name=os.path.basename(video_file),
+                                mime="video/mp4",
+                                key=f"clip_dl_video_{i}",
+                            )
+                    srt_file = cr.get("srt_path")
+                    if srt_file and os.path.isfile(srt_file):
+                        with dl_cols[1]:
+                            with open(srt_file, "r") as f:
+                                st.download_button(
+                                    t["download_srt"],
+                                    f.read(),
+                                    file_name=os.path.basename(srt_file),
+                                    mime="text/plain",
+                                    key=f"clip_dl_srt_{i}",
+                                )
+
+        # Download all as ZIP
+        if len(clip_results) > 1:
+            zip_path = create_clips_zip(clip_results, base_dir=BASE_DIR)
+            if os.path.isfile(zip_path):
+                with open(zip_path, "rb") as f:
+                    st.download_button(
+                        t["clip_download_all"],
+                        f.read(),
+                        file_name="clips.zip",
+                        mime="application/zip",
+                        key="clip_dl_zip",
+                    )
+
+        # Reset button to analyse again
+        if st.button(t["clip_analyse"], key="clip_reanalyse_btn"):
+            st.session_state.clip_sections = None
+            st.session_state.clip_results = None
+            st.session_state.clip_transcript = None
+            st.session_state.clip_error = None
+            st.rerun()
 
 
 if __name__ == "__main__":
