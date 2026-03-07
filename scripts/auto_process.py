@@ -772,7 +772,7 @@ def _latest_mp4(directory):
 # ---------------------------------------------------------------------------
 
 def download_url(url, base_dir=None, on_progress=print_progress, cookies_browser=None,
-                 cookies_file=None):
+                 cookies_file=None, cancel_event=None):
     """Download a URL using yt-dlp directly, return the downloaded file path."""
     if base_dir is None:
         base_dir = BASE_DIR
@@ -798,6 +798,7 @@ def download_url(url, base_dir=None, on_progress=print_progress, cookies_browser
         "--merge-output-format", "mp4",
         "-o", os.path.join(downloads_dir, "%(title).80s [%(id)s].%(ext)s"),
         "--no-playlist",
+        "--newline",  # print progress on separate lines for streaming
     ]
     if ffmpeg_dir:
         cmd += ["--ffmpeg-location", ffmpeg_dir]
@@ -807,12 +808,38 @@ def download_url(url, base_dir=None, on_progress=print_progress, cookies_browser
         cmd += ["--cookies-from-browser", cookies_browser]
     cmd.append(url)
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    output = proc.stdout + proc.stderr
+    # Stream output line-by-line so the UI gets progress updates
+    # and cancellation can interrupt the download.
+    output_lines = []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            output_lines.append(line)
+            # Parse download percentage for progress bar
+            m = re.match(r'\[download\]\s+([\d.]+)%', line)
+            if m:
+                pct = float(m.group(1)) / 100.0
+                on_progress(ProgressUpdate("download", line, pct * 0.5))
+            else:
+                on_progress(ProgressUpdate("download", line, -1))
+            if cancel_event and cancel_event.is_set():
+                proc.terminate()
+                proc.wait()
+                raise CancelledError()
+        proc.wait()
+    except CancelledError:
+        raise
+    except Exception:
+        proc.kill()
+        proc.wait()
+        raise
+
+    output = "\n".join(output_lines)
     if proc.returncode != 0:
         on_progress(ProgressUpdate("download", f"yt-dlp failed:\n{output}", -1))
         raise RuntimeError(f"yt-dlp download failed (exit {proc.returncode}): {output[-500:]}")
-    on_progress(ProgressUpdate("download", output, 0.5))
 
     # Strategy 1: Parse yt-dlp output for the actual filename
     latest = _parse_downloaded_file(output, downloads_dir)
@@ -985,7 +1012,8 @@ def process_video(input_source, target_lang="es", model_size="small",
         video_path = download_url(input_source, base_dir=base_dir,
                                   on_progress=on_progress,
                                   cookies_browser=cookies_browser,
-                                  cookies_file=cookies_file)
+                                  cookies_file=cookies_file,
+                                  cancel_event=cancel_event)
         tracker.finish("Downloading video")
     else:
         video_path = os.path.abspath(input_source)
