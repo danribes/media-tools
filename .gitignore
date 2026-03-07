@@ -16,3 +16,6 @@ __pycache__/
 # Temp files
 *.tmp
 .DS_Store
+
+# Environment secrets
+.env
