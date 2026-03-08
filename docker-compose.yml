@@ -6,6 +6,7 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./subbed:/app/subbed
+      - ./clips:/app/clips
       - whisper-cache:/root/.cache/huggingface
     environment:
       - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=500

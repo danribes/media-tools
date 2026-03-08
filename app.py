@@ -123,6 +123,10 @@ TRANSLATIONS = {
         "clip_start": "Start (sec)",
         "clip_end": "End (sec)",
         "clip_summary": "Summary",
+        "tab_clip_extractor": "Clip Extractor",
+        "clip_input_url": "Video URL for clip extraction",
+        "clip_input_upload": "Or upload a video file",
+        "clip_provide_input": "Provide a URL or upload a file to extract clips from.",
     },
     "es": {
         "caption": "Procesar videos: descargar, convertir, subtitular, traducir",
@@ -216,6 +220,10 @@ TRANSLATIONS = {
         "clip_start": "Inicio (seg)",
         "clip_end": "Fin (seg)",
         "clip_summary": "Resumen",
+        "tab_clip_extractor": "Extractor de clips",
+        "clip_input_url": "URL del video para extraer clips",
+        "clip_input_upload": "O subir un archivo de video",
+        "clip_provide_input": "Proporcione una URL o suba un archivo para extraer clips.",
     },
 }
 
@@ -388,7 +396,9 @@ def main():
             cookies_file = cookies_path
 
     # --- Input tabs ---
-    tab_url, tab_upload = st.tabs([t["tab_url"], t["tab_upload"]])
+    tab_url, tab_upload, tab_clips = st.tabs([
+        t["tab_url"], t["tab_upload"], t["tab_clip_extractor"],
+    ])
 
     input_source = None
 
@@ -632,8 +642,9 @@ def main():
         elif not video_path:
             st.info(t["no_output"])
 
-        # === Clip Extractor Section ===
-        _render_clip_extractor(t, result, target_lang, model_size,
+    # === Clip Extractor Tab ===
+    with tab_clips:
+        _render_clip_extractor(t, target_lang, model_size,
                                dub_audio, voice_gender, burn_subs,
                                output_codec)
 
@@ -641,6 +652,40 @@ def main():
 # ---------------------------------------------------------------------------
 # Clip extractor UI
 # ---------------------------------------------------------------------------
+
+def _run_clip_download_and_analysis(shared, url, audio_lang, model_size, api_key,
+                                    split_mode, chunk_minutes, silence_gap):
+    """Background thread: download URL then transcribe + analyse content."""
+    try:
+        from auto_process import download_url
+        log_fn = _make_callback(shared)
+        log_fn(ProgressUpdate("execution", "Downloading video...", 0.05))
+
+        ffmpeg = os.path.join(BASE_DIR, "bin", "ffmpeg")
+        if not os.path.isfile(ffmpeg):
+            ffmpeg = "ffmpeg"
+
+        downloads_dir = os.path.join(BASE_DIR, "downloads")
+        os.makedirs(downloads_dir, exist_ok=True)
+
+        video_path = download_url(
+            url, downloads_dir, ffmpeg_path=ffmpeg,
+            cancel_event=shared["cancel_event"],
+            log=lambda m: log_fn(ProgressUpdate("execution", m, -1)),
+        )
+        shared["clip_video_path"] = video_path
+
+        # Now run analysis on the downloaded file
+        _run_clip_analysis(shared, video_path, audio_lang, model_size, api_key,
+                           split_mode, chunk_minutes, silence_gap)
+        return  # _run_clip_analysis handles setting shared["processing"] = False
+    except CancelledError:
+        shared["cancelled"] = True
+    except Exception as e:
+        shared["error"] = str(e)
+    finally:
+        shared["processing"] = False
+
 
 def _run_clip_analysis(shared, video_path, audio_lang, model_size, api_key,
                        split_mode, chunk_minutes, silence_gap):
@@ -742,13 +787,45 @@ def _run_clip_extraction(shared, video_path, sections, target_lang, audio_lang,
         shared["processing"] = False
 
 
-def _render_clip_extractor(t, result, target_lang, model_size,
+def _render_clip_extractor(t, target_lang, model_size,
                            dub_audio, voice_gender, burn_subs,
                            output_codec):
-    """Render the clip extractor UI within the results area."""
+    """Render the clip extractor UI as a standalone tab."""
 
-    st.divider()
     st.subheader(t["clip_analyse"])
+
+    # --- Video input (URL or upload) ---
+    clip_url = st.text_input(
+        t["clip_input_url"],
+        placeholder="https://youtu.be/...",
+        key="clip_url_input",
+    )
+    clip_upload = st.file_uploader(
+        t["clip_input_upload"],
+        type=["mp4", "mov", "mkv", "webm"],
+        key="clip_file_upload",
+    )
+
+    # Determine source video path
+    source_video = st.session_state.get("clip_video_path")
+
+    # Handle uploaded file
+    if clip_upload is not None:
+        downloads_dir = os.path.join(BASE_DIR, "downloads")
+        os.makedirs(downloads_dir, exist_ok=True)
+        save_path = os.path.join(downloads_dir, clip_upload.name)
+        need_write = (
+            not os.path.isfile(save_path)
+            or os.path.getsize(save_path) != clip_upload.size
+        )
+        if need_write:
+            tmp_path = save_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(clip_upload.getbuffer())
+            os.replace(tmp_path, save_path)
+        source_video = save_path
+
+    audio_lang = st.session_state.get("clip_audio_lang", "en")
 
     # --- Settings row ---
     col_mode, col_key = st.columns([1, 2])
@@ -781,28 +858,19 @@ def _render_clip_extractor(t, result, target_lang, model_size,
     elif split_mode == "silence":
         silence_gap = st.slider(t["clip_silence_gap"], 1.0, 15.0, 3.0, 0.5)
 
-    # Source video path from the processed result
-    video_path = result.get("output_video") or st.session_state.get("clip_video_path")
-    # Use original video if available (better quality for clip extraction)
-    assessment = result.get("assessment", {})
-    audio_lang = assessment.get("audio_lang", "en")
-
-    # If the result has a source video path, prefer it
-    source_video = None
-    for update in st.session_state.progress_log:
-        if update.phase == "download" and "Downloaded:" in update.message:
-            m = re.search(r'Downloaded:\s+(.+\.mp4)', update.message)
-            if m and os.path.isfile(m.group(1)):
-                source_video = m.group(1)
-    if not source_video:
-        source_video = video_path
-
-    if not source_video or not os.path.isfile(source_video):
-        return
-
     # --- Analyse button ---
     if st.session_state.clip_sections is None and not st.session_state.clip_processing:
-        if st.button(t["clip_analyse"], key="clip_analyse_btn", type="primary"):
+        # Determine video source: uploaded file, previously downloaded, or URL to download
+        clip_url_val = clip_url.strip() if clip_url else ""
+        has_input = (source_video and os.path.isfile(source_video)) or (
+            clip_url_val and is_url(clip_url_val)
+        )
+
+        if not has_input:
+            st.info(t["clip_provide_input"])
+
+        if st.button(t["clip_analyse"], key="clip_analyse_btn", type="primary",
+                     disabled=not has_input):
             if split_mode == "llm" and not api_key:
                 st.error("API key required for AI content analysis.")
                 return
@@ -810,21 +878,38 @@ def _render_clip_extractor(t, result, target_lang, model_size,
                 st.warning(t["already_processing"])
                 return
 
-            st.session_state.clip_processing = True
-            shared = _make_shared()
-            shared["transcript"] = None
-            shared["sections"] = None
-            st.session_state.shared = shared
-            st.session_state.clip_video_path = source_video
+            # If we have a URL but no local file, download first
+            if not (source_video and os.path.isfile(source_video)) and clip_url_val:
+                st.session_state.clip_processing = True
+                shared = _make_shared()
+                shared["transcript"] = None
+                shared["sections"] = None
+                st.session_state.shared = shared
 
-            thread = threading.Thread(
-                target=_run_clip_analysis,
-                args=(shared, source_video, audio_lang, model_size,
-                      api_key, split_mode, chunk_minutes, silence_gap),
-                daemon=True,
-            )
-            thread.start()
-            st.rerun()
+                thread = threading.Thread(
+                    target=_run_clip_download_and_analysis,
+                    args=(shared, clip_url_val, audio_lang, model_size,
+                          api_key, split_mode, chunk_minutes, silence_gap),
+                    daemon=True,
+                )
+                thread.start()
+                st.rerun()
+            else:
+                st.session_state.clip_processing = True
+                shared = _make_shared()
+                shared["transcript"] = None
+                shared["sections"] = None
+                st.session_state.shared = shared
+                st.session_state.clip_video_path = source_video
+
+                thread = threading.Thread(
+                    target=_run_clip_analysis,
+                    args=(shared, source_video, audio_lang, model_size,
+                          api_key, split_mode, chunk_minutes, silence_gap),
+                    daemon=True,
+                )
+                thread.start()
+                st.rerun()
 
     # --- Analysis in progress ---
     if st.session_state.clip_processing:
@@ -837,6 +922,9 @@ def _render_clip_extractor(t, result, target_lang, model_size,
                 st.session_state.clip_sections = shared["sections"]
                 st.session_state.clip_transcript = shared.get("transcript")
                 st.session_state.clip_audio_lang = shared.get("audio_lang", audio_lang)
+            # Pick up video path from download if it was a URL
+            if shared.get("clip_video_path"):
+                st.session_state.clip_video_path = shared["clip_video_path"]
             st.session_state.clip_processing = False
             st.session_state.shared = None
             _processing_lock.release()
