@@ -14,15 +14,95 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from progress import ProgressUpdate, print_progress
-from subtitle_gen import get_video_info
+from subtitle_gen import get_video_info, load_whisper_model
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SCRIPT_DIR)
+
+# Maximum audio duration (seconds) to transcribe in a single Whisper pass.
+# Longer videos are split into chunks to avoid OOM on CPU.
+_CHUNK_DURATION = 1800  # 30 minutes
+
+
+# ---------------------------------------------------------------------------
+# Chunked transcription for long videos
+# ---------------------------------------------------------------------------
+
+def transcribe_long_video(video_path, language, model_size, ffmpeg_path="ffmpeg",
+                          ffprobe_path="ffprobe", log=print):
+    """Transcribe a video in chunks to avoid OOM on long files.
+
+    For videos shorter than _CHUNK_DURATION, this falls back to a single
+    transcribe_audio call.  For longer videos, it extracts audio in 30-min
+    WAV chunks, transcribes each separately, and merges the results with
+    corrected timestamps.
+    """
+    from subtitle_gen import transcribe_audio
+
+    _, _, duration, _ = get_video_info(video_path, ffprobe_path)
+
+    if duration <= _CHUNK_DURATION * 1.2:
+        # Short enough to transcribe in one pass
+        return transcribe_audio(video_path, language, model_size, log=log)
+
+    log(f"  Long video ({duration:.0f}s) — transcribing in "
+        f"{_CHUNK_DURATION // 60}-min chunks...")
+
+    model = load_whisper_model(model_size, log=log)
+    all_segments = []
+    detected_lang = language
+    chunk_idx = 0
+    offset = 0.0
+    tmpdir = tempfile.mkdtemp(prefix="whisper_chunks_")
+
+    try:
+        while offset < duration:
+            chunk_end = min(offset + _CHUNK_DURATION, duration)
+            chunk_path = os.path.join(tmpdir, f"chunk_{chunk_idx:03d}.wav")
+
+            # Extract audio chunk as WAV (Whisper-friendly format)
+            subprocess.run([
+                ffmpeg_path, "-ss", str(offset), "-t", str(chunk_end - offset),
+                "-i", video_path,
+                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                "-y", chunk_path,
+            ], capture_output=True, check=True)
+
+            log(f"  Chunk {chunk_idx + 1}: {offset:.0f}s – {chunk_end:.0f}s")
+
+            segments, detected = transcribe_audio(
+                chunk_path, language, model_size, model=model, log=log,
+            )
+            detected_lang = detected
+
+            # Offset timestamps to global timeline
+            for seg in segments:
+                seg["start"] += offset
+                seg["end"] += offset
+                all_segments.append(seg)
+
+            # Clean up chunk file immediately to save memory
+            os.unlink(chunk_path)
+
+            offset = chunk_end
+            chunk_idx += 1
+    finally:
+        # Clean up temp directory
+        for f in os.listdir(tmpdir):
+            try:
+                os.unlink(os.path.join(tmpdir, f))
+            except OSError:
+                pass
+        os.rmdir(tmpdir)
+
+    log(f"  Total: {len(all_segments)} segments from {chunk_idx} chunks.")
+    return all_segments, detected_lang
 
 
 # ---------------------------------------------------------------------------

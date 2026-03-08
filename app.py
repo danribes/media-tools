@@ -18,10 +18,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scr
 
 from progress import ProgressUpdate, format_time
 from auto_process import process_video, is_url, CancelledError
-from subtitle_gen import UnsupportedLanguageError, transcribe_audio, load_whisper_model
+from subtitle_gen import UnsupportedLanguageError
 from clip_extractor import (
     analyse_content_llm, analyse_content_fixed, analyse_content_silence,
-    process_clips, create_clips_zip,
+    process_clips, create_clips_zip, transcribe_long_video,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -649,9 +649,16 @@ def _run_clip_analysis(shared, video_path, audio_lang, model_size, api_key,
         log_fn = _make_callback(shared)
         log_fn(ProgressUpdate("execution", "Transcribing audio for analysis...", 0.1))
 
-        model = load_whisper_model(model_size)
-        segments, detected = transcribe_audio(
-            video_path, audio_lang, model_size, model=model,
+        ffmpeg = os.path.join(BASE_DIR, "bin", "ffmpeg")
+        ffprobe = os.path.join(BASE_DIR, "bin", "ffprobe")
+        if not os.path.isfile(ffmpeg):
+            ffmpeg = "ffmpeg"
+        if not os.path.isfile(ffprobe):
+            ffprobe = "ffprobe"
+
+        segments, detected = transcribe_long_video(
+            video_path, audio_lang, model_size,
+            ffmpeg_path=ffmpeg, ffprobe_path=ffprobe,
             log=lambda m: log_fn(ProgressUpdate("execution", m, -1)),
         )
         shared["transcript"] = segments
@@ -659,9 +666,6 @@ def _run_clip_analysis(shared, video_path, audio_lang, model_size, api_key,
 
         # Get video duration
         from subtitle_gen import get_video_info
-        ffprobe = os.path.join(BASE_DIR, "bin", "ffprobe")
-        if not os.path.isfile(ffprobe):
-            ffprobe = "ffprobe"
         _, _, duration, _ = get_video_info(video_path, ffprobe)
 
         log_fn(ProgressUpdate("execution", "Segmenting content...", 0.7))
